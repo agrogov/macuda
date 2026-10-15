@@ -48,12 +48,12 @@ case "$cmd" in
       export TINYNV_SOCKET=${TINYNV_SOCKET:-${TMPDIR}tinygpu.sock}
     fi
     echo "== disagg-serve start $(date '+%F %T')  model $(basename "$M")  card $CARD_PORT  metal $METAL_PORT  router $PORT  logs $ST/*-$ts.log"
-    "$CARD_BIN" -m "$M" -ngl 999 --n-cpu-moe "$NCPUMOE" --no-host --no-repack -c "$CTX" -b "$UB" -ub "$UB" -fa on --parallel 1 --no-warmup \
+    "$CARD_BIN" -m "$M" -ngl 999 --n-cpu-moe "$NCPUMOE" --no-host --no-repack -c "$CTX" -b "$UB" -ub "$UB" -fa on ${KVARGS-"-ctk q8_0 -ctv q8_0"} --parallel 1 --no-warmup \
       --host 127.0.0.1 --port "$CARD_PORT" --slot-save-path "$ST/" > "$CL" 2>&1 & cpid=$!
     echo "card=$cpid" > "$PIDF"
     wait_health "$CARD_PORT" "$cpid" "$CL" || { sh "$0" stop; exit 1; }
     /usr/bin/grep -hE 'libtinynv build|tinynv: (submitting|no gpu)|found [0-9]+ CUDA' "$CL" | head -3 | cut -c1-140 | sed 's/^/   card: /'
-    "$METAL_BIN" -m "$M" -ngl 999 -c "$CTX" -b 4096 -ub 512 -fa on --parallel 1 --no-warmup --host 127.0.0.1 --port "$METAL_PORT" --slot-save-path "$ST/" > "$ML" 2>&1 & mpid=$!
+    "$METAL_BIN" -m "$M" -ngl 999 -c "$CTX" -b 4096 -ub 512 -fa on ${KVARGS-"-ctk q8_0 -ctv q8_0"} --parallel 1 --no-warmup --host 127.0.0.1 --port "$METAL_PORT" --slot-save-path "$ST/" > "$ML" 2>&1 & mpid=$!
     echo "metal=$mpid" >> "$PIDF"
     wait_health "$METAL_PORT" "$mpid" "$ML" || { sh "$0" stop; exit 1; }
     python3 tools/disagg-router.py --listen "$PORT" --metal "http://127.0.0.1:$METAL_PORT" --card "http://127.0.0.1:$CARD_PORT" --threshold "$THRESH" --state-dir "$ST" --model "$M" --ncpumoe "$NCPUMOE" > "$RL" 2>&1 & rpid=$!
