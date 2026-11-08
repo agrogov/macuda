@@ -377,7 +377,7 @@ Implementation: `cublasGemmEx(h, tb?T:N, ta?T:N, N, M, K, &alpha, B, CUDA_R_32F,
 &beta, C, CUDA_R_32F, N, COMPUTE, CUBLAS_GEMM_DEFAULT)`. Unit-test it against a CPU triple loop for all four
 (ta,tb) combinations with odd sizes before anything else uses it (plan, M1).
 
-COMPUTE is `CUBLAS_COMPUTE_32F_FAST_TF32` by default and `CUBLAS_COMPUTE_32F` when built with `-DJT_EXACT=1` (for
+COMPUTE is `CUBLAS_COMPUTE_32F_FAST_TF32` by default and `CUBLAS_COMPUTE_32F` when built with `-DJT_EXACT=1` or run with `JT_EXACT=1` in the environment, as the shim checkpoints do (for
 gradchecks). libtinycublas accepts both for fp32 A/B (cublas.c's type contract; `test/cublas_contract.c` checks it).
 On the shim, `TINYCUBLAS_TC=0` in the environment additionally forces the non-tensor-core path; use it for gradchecks.
 
@@ -681,7 +681,9 @@ is a smoke check only; the exact build is the gate.
 
 ### 10.4 On the shim (Mac + eGPU)
 
-Same binary source, linked against the shim. Gates: 10.3.1 (eval parity, 160 rows) and 10.3.2 (20 steps), comparing
+Same binary source, linked against the shim. Each piece goes to the card soon after it passes on gpubox: the GEMMs, the
+kernels, then the forward and backward against `dump_ref.py`, at the same gates as on gpubox (Plan M1–M5 checkpoints).
+Whole-trainer gates, at the end: 10.3.1 (eval parity, 160 rows) and 10.3.2 (20 steps), comparing
 with the gpubox jefftrain numbers. Expect near-identical (same kernels; cuBLAS vs tinycublas GEMM order is the only
 difference). Then one full arm, timed.
 
@@ -713,17 +715,18 @@ Source rules that keep both builds working:
 `make shim` details, all from `cuda-shim/Makefile` and `build/tinycc`:
 ```
 CC       = /opt/homebrew/opt/llvm/bin/clang
-SDK      = $(shell sh ../../cuda-shim/build/sdk.sh)
-CUDA_INC = ../../cuda-shim/cuda-13/include
-SHIM     ?= ../../cuda-shim/build/shim            # or build/shim-sm_89 for the Ada card; must match TINYCC_ARCH
+MACUDA   ?= $(HOME)/Downloads/vfio/macuda          # the main checkout: a worktree has no git-ignored shim build or headers
+SDK      = $(shell sh $(MACUDA)/cuda-shim/build/sdk.sh)
+CUDA_INC = $(MACUDA)/cuda-shim/cuda-13/include
+SHIM     ?= $(MACUDA)/cuda-shim/build/shim            # or build/shim-sm_89 for the Ada card; must match TINYCC_ARCH
 CFLAGS   = -isysroot $(SDK) -std=c11 -O2 -g -Wall -Wextra -I$(CUDA_INC) -Isrc
-kernels: TINYCC_GGML_MAC=$(abspath .) TINYCC_ARCH=$(ARCH) sh ../../cuda-shim/build/tinycc kernels/X.cu -o build/shim/X.o
+kernels: TINYCC_GGML_MAC=$(abspath .) TINYCC_ARCH=$(ARCH) sh $(MACUDA)/cuda-shim/build/tinycc kernels/X.cu -o build/shim/X.o
 link:    $(CC) $(CFLAGS) build/shim/*.o src/*.c $(SHIM)/libtinycudart.a $(SHIM)/libtinycublas.a $(SHIM)/nv/libtinynv.a \
              /opt/homebrew/opt/llvm/lib/libLLVMDemangle.a -lc++ -lm -o build/shim/jefftrain
 ```
 `TINYCC_GGML_MAC` must be a directory that contains the `.cu` source: tinycc mounts it read-only at `/ggml` in the
 container, or expects it synced at `$TINYCC_GGML_LINUX` on the ssh host. Point it at `train/jeff`. `ARCH` is the
-card's: `sm_120a` for the 5090, `sm_89` for the Ada card (with `SHIM=../../cuda-shim/build/shim-sm_89`). Ask which card the run is for; don't guess.
+card's: `sm_120a` for the 5090, `sm_89` for the Ada card (with `SHIM=$(MACUDA)/cuda-shim/build/shim-sm_89`). Ask which card the run is for; don't guess.
 
 ### 11.2 Running on the card
 
@@ -731,10 +734,11 @@ The null device (the hardware path needs both `TINYNV_HW` and `TINYNV_SOCKET`; r
 allocation and launch sequencing work, not numbers. Every run on real hardware goes through the repository's
 hardware protocol:
 ```
-sh tools/nv_shim_step.sh <A|B> probe train/jeff/build/shim/jefftrain <args...>
+sh $MACUDA/tools/nv_shim_step.sh <A|B> probe $PWD/build/shim/jefftrain <args...>
 ```
 which does preflight, the run as its own process with the log captured, then quiesce. The card is shared with other
-sessions: ask the user before taking it, every time.
+sessions: ask the user before taking it, every time. `scripts/card-check.sh` (Plan M0.4) wraps a milestone's tests into
+one such run per checkpoint, so one OK covers the checkpoint.
 
 ### 11.3 gpubox
 
@@ -760,7 +764,7 @@ From `nm` on `build/shim-sm_89/libtinycudart.a` and `libtinycublas.a`, 2026-11-0
 * cuBLAS (all of libtinycublas's exports): cublasCreate_v2, cublasDestroy_v2, cublasSetStream_v2,
   cublasSetMathMode, cublasSetWorkspace_v2, cublasGetStatusString, cublasGemmEx, cublasGemmBatchedEx,
   cublasGemmStridedBatchedEx, cublasSgemm_v2, cublasSgemmBatched, cublasSgemmStridedBatched, cublasStrsmBatched.
-  jefftrain uses only cublasGemmEx and cublasGemmStridedBatchedEx for math. Plan M7.2 checks that the strided-batched
+  jefftrain uses only cublasGemmEx and cublasGemmStridedBatchedEx for math. Plan M1.2a checks that the strided-batched
   entry point accepts COMPUTE_32F_FAST_TF32 with fp32 A/B/C on the shim, as GemmEx does.
 
 **Missing, do not use:** cudaLaunchKernel, cudaStreamCreate, cudaEventCreate, cudaEventElapsedTime (time on the host
@@ -797,7 +801,7 @@ train/jeff/
   py/
     prep.py  make_fixture.py  make_adapter.py  dump_ref.py  compare_layers.py
   scripts/
-    gpubox-sync.sh  gpubox-build.sh  parity-eval.sh  parity-steps.sh  arm.sh
+    gpubox-sync.sh  gpubox-build.sh  card-check.sh  parity-eval.sh  parity-steps.sh  arm.sh
 ```
 
 The model is described by one table in `model.c`, not by string building scattered through the code: for each
@@ -816,6 +820,7 @@ calls them.
 | layout mistake (q/gate interleave, conv taps, head order) | dump_ref.py layer-by-layer parity on real weights pinpoints the first layer and tensor that diverges |
 | GDN kernel too slow on the shim | v1 is fine at about 2 ms/layer; chunked WY form is M8 |
 | shim lacks an API | section 12 plus `make check-symbols` before anything runs |
+| strided-batched TF32 rejected, or a GDN kernel misbehaves on the shim | found by the card checkpoints at Plan M1.2a and M3.2a, before the code that depends on them is written |
 | tinycublas TF32 numerics differ from cuBLAS | the gate is against the exact build; TF32 runs are compared run-to-run only |
 | the batch order differs from Python | prep.py reuses train.py's own functions; the M5 test compares batch lists |
 | memory on a 12 GB card | layer recompute plus a single-batch arena; `--batch 4` fallback; the arena size is printed at start |

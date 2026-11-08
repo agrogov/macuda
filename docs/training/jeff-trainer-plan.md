@@ -32,7 +32,8 @@ in the same change.
 5. **No real data in macuda.** Meeting transcripts and anything made from them (`.jtb` from real splits,
    predictions, reports) stay in CLM-8B's `data/` or on gpubox. Tests in macuda use synthetic fixtures (D§10.1).
 6. **The card is shared.** Every run on the Mac's eGPU goes through `tools/nv_shim_step.sh` and needs the user's
-   OK each time. gpubox runs (192.168.31.162, `ssh gpubox`) need an OK for anything long (over about 10 min) or anything
+   OK each time. A card checkpoint (`scripts/card-check.sh`, M0.4) is one run for this purpose: one OK covers all its
+   steps. Ask which card in the same message, because `make shim` needs `ARCH=`. gpubox runs (192.168.31.162, `ssh gpubox`) need an OK for anything long (over about 10 min) or anything
    that takes the whole GPU.
 7. **Commit only when the user asks.** macuda's main checkout has other people's *staged* files, and a plain
    `git commit` on a new branch would sweep them in. Work in a separate worktree, which has its own index:
@@ -46,19 +47,32 @@ in the same change.
 | M | what | proves | where it runs |
 |---|---|---|---|
 | M0 | scaffold, both builds of a trivial kernel | toolchains and link line | Mac (null device), gpubox |
-| M1 | `gemm.c` row-major wrappers + `st.c` + `jtb.c` | the GEMM contract, file readers | gpubox; Mac null device |
-| M2 | elementwise/row kernels + CPU refs + gradchecks | each small op, fwd and bwd | gpubox |
-| M3 | GDN recurrence fwd/bwd | the hard kernel | gpubox |
-| M4 | full forward on real weights vs `dump_ref.py` | layouts, model assembly | gpubox |
-| M5 | backward, LoRA, Adam, schedule, prep.py batch order | one training step bit-close to PyTorch | gpubox |
+| M1 | `gemm.c` row-major wrappers + `st.c` + `jtb.c` | the GEMM contract, file readers | gpubox, then a card check of the GEMMs; Mac null device |
+| M2 | elementwise/row kernels + CPU refs + gradchecks | each small op, fwd and bwd | gpubox, then one card check |
+| M3 | GDN recurrence fwd/bwd | the hard kernel | gpubox, then card checks after fwd and after bwd |
+| M4 | full forward on real weights vs `dump_ref.py` | layouts, model assembly | gpubox, then one card check |
+| M5 | backward, LoRA, Adam, schedule, prep.py batch order | one training step bit-close to PyTorch | gpubox, then one card check |
 | M6 | eval/step/run parity, timing | the whole trainer | gpubox |
-| M7 | shim build, card run | macuda can train Jeff | Mac + eGPU |
+| M7 | eval parity, 20-step parity, timed arm on the shim | macuda can train Jeff | Mac + eGPU |
 | M8 | speed (bf16 weights, chunked GDN, fused kernels) | optional | both |
 
 gpubox is the development box for M1–M6 because it has real nvcc and cuBLAS, so a failure there is jefftrain's
-own fault. The shim enters at M7 with known-good code, which means any new failure there is a shim question.
-A Mac null-device build is kept green from M0 onward (`make shim test-null`), so shim incompatibilities show up
-early as link or launch errors, even though the numbers come later.
+own fault. Each piece passes on gpubox first and then goes to the card at the next checkpoint, so a failure that
+appears only on the card is a shim question. A Mac null-device build is kept green from M0 onward
+(`make shim test-null`), which catches link and launch errors between checkpoints.
+
+**Card checkpoints** come early because two things could force a kernel redesign: tinycublas rejecting strided-batched
+TF32, and tinycc's build of the GDN kernels behaving differently. The rules for every checkpoint:
+1. Run it only after that piece's gpubox gate has passed. Then `make shim ARCH=<card> && make test-null &&
+   make check-symbols`, ask the user (rule 6), and run the `card-check.sh` line the milestone gives.
+2. The gates are the same numbers as on gpubox, and the shim build has no `-DJT_EXACT` (exact mode comes from the
+   environment, so one build serves both modes).
+3. While waiting for the OK, you may carry on with gpubox work, except for what the checkpoint says has to wait for
+   its result. Don't skip the checkpoint; leave its Appendix B box empty.
+4. If a checkpoint fails, stop and report it to the user with the log path before starting the next milestone. Say
+   which step failed and that the same test passes on gpubox. Don't change the shim (rule 4), and don't change or
+   weaken a kernel, gate or compute mode to make the card pass unless the user agrees.
+5. M6 has no checkpoint: its reference runs are on gpubox.
 
 ---
 
@@ -76,6 +90,8 @@ Create the tree from D§13 with empty files where needed. `Makefile` targets:
 | `check-symbols` | D§11.1: `nm -u build/shim/*.o` (the unlinked objects: the linked binary shows nothing undefined), filter `_cuda`/`_cublas`, each must be defined in the shim archives |
 | `clean` | `rm -rf build` |
 
+`MACUDA ?= $(HOME)/Downloads/vfio/macuda` is the main checkout. The shim's libraries, `cuda-shim/cuda-13/include` and
+the tools come from there, since the worktree of rule 7 has no git-ignored build output (D§11.1).
 `ARCH ?= sm_120` for `nv`. For `shim`, `ARCH` has no default: `make shim` without `ARCH=` prints
 "set ARCH=sm_120a (5090) or sm_89 (Ada, with SHIM=.../shim-sm_89); ask which card" and fails.
 
@@ -99,6 +115,56 @@ print `hello OK`.
 * `scripts/gpubox-run.sh <binary> [args]`: build, then run `build/nv/<binary>` there, streaming the output.
 
 **Done when:** `bash scripts/gpubox-run.sh test_hello` prints `hello OK`.
+
+### M0.4 `scripts/card-check.sh`
+One script runs each card checkpoint, so the user approves one run and not one per test. Write it as given:
+```sh
+#!/bin/sh
+# One card checkpoint; the user's OK covers all its steps. DRY=1 uses the null device: no preflight, no card.
+# usage: sh scripts/card-check.sh <A|B> <m0|m1|m2|m3-fwd|m3|m4|m5>
+# m4 and m5 also need JT_REF (ref.safetensors) and JT_DUMP_ARGS (--model/--init-adapter/--train flags, Mac paths).
+set -u
+WHO=${1:?A|B}; CP=${2:?checkpoint}
+JEFF=$(cd "$(dirname "$0")/.." && pwd); B=$JEFF/build/shim
+MACUDA=${MACUDA:-$HOME/Downloads/vfio/macuda}   # the main checkout: the built shim, tools/ and logs/ are there
+PY=${JT_PY:-$HOME/Downloads/CLM-8B/.venv/bin/python}
+EXACT="JT_EXACT=1 TINYCUBLAS_TC=0"
+n=0; failed=0
+finish() { echo "checkpoint $CP: $n steps, $failed failed"; [ "$failed" -eq 0 ] && exit 0; exit 1; }
+stop() { echo "STOP: $1"; failed=$((failed+1)); finish; }
+# step <env words, or -> <binary> [args...]. A step that never ran, crashed or was void ends the checkpoint.
+step() {
+  envs=$1; bin=$2; shift 2; [ "$envs" = - ] && envs=
+  n=$((n+1)); echo "=== step $n: $envs $(basename "$bin") $*"
+  tmp=$(mktemp); env $envs sh "$MACUDA/tools/nv_shim_step.sh" "$WHO" probe "$bin" "$@" > "$tmp" 2>&1; rc=$?; cat "$tmp"
+  ran=0; grep -q '   exit [0-9]* after' "$tmp" && ran=1; rm -f "$tmp"
+  [ "$ran" = 1 ] || stop "step $n never ran (rc $rc)"
+  [ "$rc" -gt 128 ] && stop "step $n crashed (rc $rc): the card's state is unknown"
+  [ "$rc" = 97 ] && stop "step $n was void: it did not have the card to itself"
+  [ "$rc" = 0 ] || { echo "FAILED: step $n (rc $rc)"; failed=$((failed+1)); }
+}
+case $CP in
+  m0) step - "$B/test_hello" ;;
+  m1) step "$EXACT" "$B/test_gemm"; step - "$B/test_gemm" ;;   # exact, then TF32
+  m2) step - "$B/test_kernels" all ;;
+  m3-fwd) step - "$B/test_gdn" fwd ;;
+  m3) step - "$B/test_gdn" all ;;
+  m4|m5)
+    : "${JT_REF:?path to ref.safetensors}"; : "${JT_DUMP_ARGS:?flags for the dump run}"
+    out=$(mktemp -d)/$CP.safetensors; flag=--dump-forward; [ "$CP" = m5 ] && flag=--dump-backward
+    step "$EXACT" "$B/jefftrain" $JT_DUMP_ARGS $flag "$out"
+    [ "${DRY:-0}" = 1 ] || "$PY" "$JEFF/py/compare_layers.py" "$JT_REF" "$out" --atol-rel 1e-3 --grad-rel 5e-3 \
+      || { echo "FAILED: compare_layers"; failed=$((failed+1)); } ;;
+  *) echo "unknown checkpoint $CP"; exit 2 ;;
+esac
+finish
+```
+`nv_shim_step.sh` comes from the main checkout because the worktree of rule 7 has no built shim (those files are
+git-ignored). Its line `WARNING: binary is not a clean build…` is expected: it only knows macuda's own binaries.
+A real run is `sh scripts/card-check.sh <A|B> <checkpoint>`, from `train/jeff`.
+
+**Done when:** `DRY=1 sh scripts/card-check.sh A m0` prints `checkpoint m0: 1 steps, 0 failed`, and
+`DRY=1 sh scripts/card-check.sh A nope` exits 2. Don't run m0 for real: the M1 checkpoint is the first one on the card.
 
 ---
 
@@ -124,10 +190,23 @@ seed, and a check of:
 * gemm_batched with batch 8, (ta,tb) = (0,1), (0,0), (1,0), sizes (L=37, 256) and (L=300, 256), strides = M*K etc.
 
 Error metric everywhere in this plan: `rel = max|got-want| / max(1e-30, max|want|)`.
-Gate: `rel < 1e-5` with JT_EXACT=1; `rel < 5e-3` with TF32. Print one line per case plus `GEMM OK n/n`.
+Gate: `rel < 1e-5` with JT_EXACT=1; `rel < 5e-3` with TF32. Print one line per case plus `GEMM OK n/n`, and exit 1
+if any case failed.
 
 **Done when:** on gpubox, `JT_EXACT=1 build/nv/test_gemm` and `build/nv/test_gemm` both print `GEMM OK`. Mac:
 `make shim test-null` is still green.
+
+### M1.2a Card checkpoint: GEMMs (the first run on the card; ask for it now)
+`sh scripts/card-check.sh <A|B> m1`, under the rules in "Milestones at a glance". It runs `test_gemm` in exact mode,
+then in TF32, including `gemm_batched`.
+
+This is the check for D§12's open question: does tinycublas accept `cublasGemmStridedBatchedEx` with
+`CUBLAS_COMPUTE_32F_FAST_TF32`? If it returns NOT_SUPPORTED, report that and wait. The attention code
+relies on this call, so the user decides what happens next.
+
+M1.3 through M3 can go ahead while this waits. `layer_attn.c` (M4.3) can't start until the result is in.
+
+**Done when:** both steps print `GEMM OK`, and `checkpoint m1: 2 steps, 0 failed`.
 
 ### M1.3 `src/st.c`: safetensors
 * `st_open(path) → St*`: `mmap` the file; parse the u64 header length and the JSON header. A tiny hand-written
@@ -174,6 +253,8 @@ change description).
   * `CHECK_REL(name, got, want, n, tol)`, which prints `ok  name rel=…` or `FAIL name rel=… tol=…`, counts
     failures, and makes `main` return 1 if any failed
   * `dev_upload(host, n) → float*`, `dev_download(dev, host, n)`
+* `test/test_kernels.c` takes a group name (`misc`, `norm`, `act`, `rope`, `conv`, `attn`, `head`, `adam`) or `all`, and
+  `test/test_gdn.c` takes `fwd`, `bwd` or `all`. The card checkpoints call them with those arguments.
 * `test/gradcheck.c` (CPU only, double): for each backward ref, pick a random input x and a random cotangent w for
   the output. Analytic: `ref_*_bwd(w) → gx`. Numeric: for each element i of x (all of them; the sizes are small),
   `(L(x+h e_i) − L(x−h e_i)) / 2h`, with `L(x) = Σ w·f(x)` and h = 1e-6. Gate: `rel_err < 1e-6`. Also check the
@@ -259,6 +340,12 @@ here.
 **Done when:** `test_kernels adam` is green. Also check the total count: printing the size of `lora_alloc` must give
 `trainable 10,484,736`.
 
+### M2.7 Card checkpoint: small kernels
+`sh scripts/card-check.sh <A|B> m2`, once every M2 test is green on gpubox.
+
+**Done when:** `checkpoint m2: 1 steps, 0 failed`, with the same gates as M2.1–M2.6 (the host side here is the same
+CPU reference, so the check is the kernel's value on the card).
+
 ---
 
 ## M3. The GDN recurrence
@@ -300,6 +387,13 @@ of the conv output (after l2norm), and g and beta as [N][16].
 {200, 7, 130}, {1026, 520, 670, 300, 811, 455, 610, 702}, gives `rel < 1e-4` against `ref_gdn_fwd` (float build),
 and the spill check is clean.
 
+### M3.2a Card checkpoint: GDN forward (before M3.3)
+`sh scripts/card-check.sh <A|B> m3-fwd`. This is the riskiest kernel and the backward is built on the same structure,
+so learn how it behaves on the shim before writing the backward. Report the failing batch and the log path if it
+fails. M3.3 doesn't start until this result is in.
+
+**Done when:** `checkpoint m3-fwd: 1 steps, 0 failed`.
+
 ### M3.3 `kernels/gdn.cu`: backward
 Follow D§8.3's phase A / phase B text exactly. Supporting buffers (allocated once by the caller):
 * `sp`: `[B*16*4][64][128][32]` floats, the per-block S_prev scratch for one segment (1 MB per block).
@@ -340,6 +434,11 @@ Cross-warp column sums (kv_j and ddelta_j): each warp computes its 64-row partia
 clean for `gdn_bwd_kernel`. Also time it: one call at B=8, lengths p50-ish (about 520), on gpubox. The design
 budget is about 2 ms per layer for fwd + bwd. Write the number down. If it's over 10 ms, look for spills first.
 
+### M3.4 Card checkpoint: GDN forward and backward
+`sh scripts/card-check.sh <A|B> m3`, with the time per layer from the same test, next to the gpubox number.
+
+**Done when:** `checkpoint m3: 1 steps, 0 failed`, and the card's time per layer is written down in Appendix B.
+
 ---
 
 ## M4. The full forward on real weights
@@ -363,7 +462,7 @@ These run in CLM-8B's venv (Mac: `~/Downloads/CLM-8B/.venv`; gpubox: `~/CLM-8B/.
   list. Also save `layer.{i}.in` (the input hidden state) so a single layer can be tested in isolation.
 * `compare_layers.py a.safetensors b.safetensors [--atol-rel 1e-3 --grad-rel 5e-3]`: for every key in both files,
   print `key  rel  ok/FAIL` in file order. The **first** failing key is what matters, so also print it on its own
-  line at the end.
+  line at the end. Exit 1 if any key failed or the files share no keys.
 
 ### M4.2 `src/model.c`: load
 * The model table (D§13), loaded with `st_get` and an explicit expected shape for every tensor. Convert to fp32 on
@@ -398,6 +497,22 @@ If layer 3 (the first attention layer) is the first failure, suspect, in this or
 positions (local vs packed), the head-to-group mapping (h/4, not h%2), and the q_norm offset (1+w).
 If layer 0 fails: the conv tap order, the l2norm being sum and not mean, the gated norm being w and not (1+w),
 and the A_log sign.
+
+### M4.4 Card checkpoint: the full forward
+Copy `ref.safetensors`, the adapter and the 2-row fixture from gpubox to `/tmp` on the Mac (all made from synthetic
+rows and a public model; they stay out of the repo). The model is in the Mac's HF cache. Before the first run,
+confirm it's byte-for-byte the model `ref.safetensors` was made from: compare `shasum -a 256 *.safetensors` in that
+snapshot folder with `ssh gpubox 'cd ~/models/jeff-base && sha256sum *.safetensors'`, and stop and tell the user if
+any shard differs (otherwise a wrong model gets reported as a shim failure). `test_st --list` isn't enough, since it
+only shows names and shapes. Then, with the flags of the gpubox run and Mac paths:
+```
+JT_REF=/tmp/jeff-ref/ref.safetensors JT_DUMP_ARGS="--model <M> --init-adapter /tmp/jeff-ref/adapter --train /tmp/jeff-ref/fx.jtb" \
+  sh scripts/card-check.sh <A|B> m4
+```
+Exact mode, because it's the same 1e-3 gate as gpubox. If `jefftrain` runs out of card memory, report the card and
+the arena size it printed. Don't shrink the fixture.
+
+**Done when:** `checkpoint m4: 1 steps, 0 failed`, with `compare_layers.py` clean for every key.
 
 ---
 
@@ -466,6 +581,13 @@ Tokenisation must be train.py's: call its `encode(rows, decision, tok, hard)` wi
 
 **Done when:** the trace matches for seeds 0 and 1, with `--weights none` and `balanced`.
 
+### M5.4 Card checkpoint: the backward
+Same files and flags as M4.4, once M5.1's gate has passed on gpubox: `sh scripts/card-check.sh <A|B> m5` (again with
+`JT_REF` and `JT_DUMP_ARGS` set). It needs the `--dump-backward` flag from M5.2 and nothing from M5.3.
+
+**Done when:** `checkpoint m5: 1 steps, 0 failed`, with every `grad.layer.{i}.out`, all 300 LoRA grads and
+`grad.readout` inside the 5e-3 gate.
+
 ---
 
 ## M6. End-to-end parity and timing on gpubox
@@ -515,37 +637,34 @@ within 0.02, score.py metrics inside the two-seed noise band). Report the table 
 
 ## M7. The shim: macuda trains Jeff
 
-Up to now, any shim-specific failure was impossible by construction. Now the binary changes and nothing else does.
+By now the GEMMs, every kernel, and the forward and backward at layer level have passed on the card (M1–M5). M7 tests
+what those couldn't: the whole trainer on real rows, over many steps, and its speed. It needs the gpubox outputs from
+M6. If any kernel or model code changed after its checkpoint, run that checkpoint again first.
 
 ### M7.1 Build and null-device run
-`make shim ARCH=<ask>` and `make check-symbols` (every `cuda*`/`cublas*` symbol defined). `make test-null`: every
-test reaches its end with no CUDA error (on the null device the numbers are meaningless; tests skip their value
-checks unless `TINYNV_HW` and `TINYNV_SOCKET` are both set, as M0.2 set up). Then `jefftrain --eval-only` on a fixture with a null device runs
-start-up, allocation and the launch sequence end to end.
+`make shim ARCH=<ask>`, `make check-symbols` and `make test-null`. Then `jefftrain --eval-only` on a fixture with a
+null device runs start-up, allocation and the launch sequence end to end.
 
 **Done when:** all three are green. If a symbol is missing, don't add it to the shim: change jefftrain to use an API
 from D§12's list, or ask the user.
 
-### M7.2 Kernel and GEMM tests on the card (ask the user first, every time)
-```
-sh tools/nv_shim_step.sh <A|B> probe train/jeff/build/shim/test_gemm
-sh tools/nv_shim_step.sh <A|B> probe train/jeff/build/shim/test_kernels all
-sh tools/nv_shim_step.sh <A|B> probe train/jeff/build/shim/test_gdn all
-```
-Run `test_gemm` with `JT_EXACT=1 TINYCUBLAS_TC=0` and again in the default mode, and specifically check
-`gemm_batched` with TF32 compute (D§12's open question about strided batched + TF32 on the shim). If tinycublas
-returns NOT_SUPPORTED there, report it to the user. Don't work around it silently.
+### M7.2 Eval parity on the card (ask first)
+The 160 test rows. The .jtb is real data, so it lives under CLM-8B's `data/`, and the binary reads it from there.
+Run `jefftrain --eval-only` through `sh $MACUDA/tools/nv_shim_step.sh <A|B> probe $PWD/build/shim/jefftrain <flags>`.
+Compare against gpubox jefftrain's `pred-test.jsonl`.
 
-### M7.3 Model parity on the card
-The Mac has the model in the HF cache and the fixtures. Copy `ref.safetensors` from gpubox (it's made from synthetic
-rows and a public model, so it may sit in `/tmp` on the Mac but still not in the repo). Run `--dump-forward` and
-`--dump-backward` through `nv_shim_step.sh` and compare with `compare_layers.py`, using the same gates as M4/M5.
-Then eval parity: the 160 test rows. The .jtb is real data, so it lives under CLM-8B's `data/`, and the binary reads
-it from there. Compare against gpubox jefftrain's `pred-test.jsonl` (expect max |dp| < 0.01).
+**Done when:** max |dp| < 0.01 over the 160 rows.
 
-### M7.4 A training run on the card (ask; it holds the card for hours)
-20 steps first (step parity against gpubox jefftrain's `steps.jsonl`), then, if the user wants it, one full arm, timed.
-Report s/step, peak memory and the D§10.3.3 metrics.
+### M7.3 Step parity on the card (ask first)
+20 steps with the M6.2 arguments, in the same way. Compare against gpubox jefftrain's `steps.jsonl`.
+
+**Done when:** M6.2's gate holds against that file.
+
+### M7.4 A timed arm on the card (ask; it holds the card for hours)
+One full arm, if the user wants it. Report s/step, peak memory and the D§10.3.3 metrics.
+
+**Done when:** the numbers are in Appendix B and the D§10.3.3 metrics are reported to the user, or the user has said
+to skip the arm.
 
 ---
 
@@ -575,15 +694,15 @@ In expected order of payoff:
 | fine at batch 1, wrong at batch 3 | row boundaries in conv/GDN/RoPE; `row_of`/`off` upload; head gather index `off[b+1]-1` |
 | gradients right, loss diverges over steps | Adam bias correction t (starts at 1); lr schedule s (starts at 0); clip applied after the norm |
 | run-to-run differences in exact mode | a float `atomicAdd` somewhere; a reduction whose order depends on the block count |
-| works on gpubox, fails on the shim | `make check-symbols`; `JT_DEBUG=1` to find the first failing launch; dynamic smem > 48 KB without `cudaFuncSetAttribute` |
+| works on gpubox, fails on the shim | stop and report (card checkpoint rule 4); `make check-symbols`; `JT_DEBUG=1` to find the first failing launch; dynamic smem > 48 KB without `cudaFuncSetAttribute` |
 
 ## Appendix B. Done-ness checklist (copy into the final change description)
 
 - [ ] M0 both builds, check-symbols
-- [ ] M1 GEMM 4 modes × exact/TF32; safetensors listing matches D§3.2; JTB reader
-- [ ] M2 every kernel: gradcheck + GPU vs ref
-- [ ] M3 GDN fwd/bwd vs ref, zero spills, time per layer: ___ ms
-- [ ] M4 forward vs dump_ref, all layers < 1e-3
-- [ ] M5 backward vs dump_ref, all grads < 5e-3; prep.py order == train.py order
+- [ ] M1 GEMM 4 modes × exact/TF32; safetensors listing matches D§3.2; JTB reader; card m1 (strided-batched TF32 accepted)
+- [ ] M2 every kernel: gradcheck + GPU vs ref; card m2
+- [ ] M3 GDN fwd/bwd vs ref, zero spills, time per layer: ___ ms; card m3-fwd, m3, time per layer on the card: ___ ms
+- [ ] M4 forward vs dump_ref, all layers < 1e-3; card m4
+- [ ] M5 backward vs dump_ref, all grads < 5e-3; prep.py order == train.py order; card m5
 - [ ] M6 eval parity ___/160, max dp ___; step parity; s/step ___; run parity table
-- [ ] M7 shim: tests on card; eval parity vs gpubox; 20-step parity; (optional) full arm s/step ___
+- [ ] M7 shim: eval parity vs gpubox, max dp ___; 20-step parity; (optional) full arm s/step ___
