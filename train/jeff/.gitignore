@@ -1,0 +1,7 @@
+# build output (nv, shim, cpu), and the tinycc sibling copies the shim build makes and deletes
+build/
+kernels/.tc_*
+__pycache__/
+# fixtures, dumps and adapters are generated, never committed (no real data in macuda: plan rule 5)
+*.jtb
+*.safetensors
