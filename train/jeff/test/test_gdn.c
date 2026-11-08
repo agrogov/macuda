@@ -21,6 +21,12 @@
 //     stores; letting them change the arithmetic would be a bug);
 //   * replaying the last segment on the host from the kernel's own 64-KB checkpoint must reproduce the o the kernel wrote
 //     for the tokens of that segment — the checkpoint's contents and the moment it was written, both.
+//
+// `bwd` runs the same batches (plus a uniform B = 8 at the dataset's median row length, for the one-call time) through
+// gdn_fwd for the checkpoints and then gdn_bwd, and checks dq, dk, dv, dg and dbeta against ref_gdn_bwd. Two more
+// properties there: every output buffer is garbage-filled first, so a block that skipped a segment shows up as a failed
+// check, and the kernel's sp scratch (phase A's S_prev) is replayed from the same checkpoint on the host in double —
+// which is the only check on phase A's contents, since ref_gdn_bwd keeps its S_prev copies to itself.
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -229,12 +235,245 @@ static int group_fwd(void) {
 }
 
 // ---- the backward (plan M3.3) -----------------------------------------------------------------------------------
-// Not written yet: a later task fills this in (plan M3.3: five gradients against ref_gdn_bwd, the same batches). Until
-// then the group is a stub, so `test_gdn all` fails on it (that is card checkpoint m3's line) and the no-argument run
-// skips it.
+// Phase A's own check: design §3.6's step on the host in double, started from the same checkpoint the kernel started
+// from, keeping S_prev for every token of one segment. Sp receives [cnt][D][D] with tl slowest. This is the check that
+// the kernel's sp scratch holds S_prev -- the state *before* each step -- at the right token, which is what phase B
+// reads; ref_gdn_bwd keeps its own S_prev copies internally and does not expose them (J13/J16 notes).
+static void replay_segment_sp(const float *S0, const float *k, const float *v, const float *g, const float *beta,
+                              int H_, int t_row0, int seg, int cnt, int h, double *Sp) {
+  double *S = (double *)xalloc((size_t)D * (size_t)D * sizeof *S);
+  double delta[D];
+  for (int i = 0; i < D; i++)
+    for (int j = 0; j < D; j++) S[(size_t)i * D + j] = (double)S0[(size_t)i * D + j];
+  for (int tl = 0; tl < cnt; tl++) {
+    memcpy(Sp + (size_t)tl * D * D, S, (size_t)D * D * sizeof *Sp); // S_prev, before the step
+    const size_t gi = (size_t)(t_row0 + seg * JT_GDN_SEG + tl) * (size_t)H_ + (size_t)h;
+    const double e = exp((double)g[gi]), bt = (double)beta[gi];
+    for (int j = 0; j < D; j++) { // S = S * exp(g_t);  kv[j] = sum_i S[i,j] k_t[i];  delta[j] = (v - kv) * beta
+      double acc = 0.0;
+      for (int i = 0; i < D; i++) {
+        S[(size_t)i * D + j] *= e;
+        acc += S[(size_t)i * D + j] * (double)k[gi * (size_t)D + (size_t)i];
+      }
+      delta[j] = ((double)v[gi * (size_t)D + (size_t)j] - acc) * bt;
+    }
+    for (int j = 0; j < D; j++) // S[i,j] += k_t[i] delta[j]
+      for (int i = 0; i < D; i++) S[(size_t)i * D + j] += (double)k[gi * (size_t)D + (size_t)i] * delta[j];
+  }
+  free(S);
+}
+
+// Compare the kernel's sp slice for one block (b, h, tile, segment 0 -- the last phase A a block runs) against the
+// replay above. The buffer is garbage-filled before the launches, so a block that never wrote its segment is caught.
+static void check_sp(const float *sp_d, const float *ck_d, const float *k, const float *v, const float *g,
+                     const float *beta, const int *off, int B, int nseg, int h, int tile, const char *tag) {
+  const int b = B - 1, len = off[b + 1] - off[b];
+  const int cnt = len < JT_GDN_SEG ? len : JT_GDN_SEG; // segment 0's tokens
+  const size_t blk = (size_t)JT_GDN_SEG * (size_t)D * (size_t)JT_GDN_TILE;
+  const size_t at = (((size_t)b * (size_t)H + (size_t)h) * (size_t)JT_GDN_TILES + (size_t)tile) * blk;
+  float *sp_h = (float *)xalloc(blk * sizeof *sp_h);
+  float *ck0 = (float *)xalloc(JT_GDN_CKPT_FLOATS * sizeof *ck0);
+  dev_download(sp_d + at, sp_h, blk);
+  dev_download(ck_d + (((size_t)b * (size_t)H + (size_t)h) * (size_t)nseg) * JT_GDN_CKPT_FLOATS, ck0,
+               JT_GDN_CKPT_FLOATS);
+  // The replay's full [cnt][D][D] and the tile's columns of it, which is what one block holds in sp.
+  double *Sp = (double *)xalloc((size_t)cnt * D * D * sizeof *Sp);
+  float *want = (float *)xalloc((size_t)cnt * D * JT_GDN_TILE * sizeof *want);
+  replay_segment_sp(ck0, k, v, g, beta, H, off[b], 0, cnt, h, Sp);
+  for (int tl = 0; tl < cnt; tl++)
+    for (int i = 0; i < D; i++)
+      for (int l = 0; l < JT_GDN_TILE; l++)
+        want[((size_t)tl * D + (size_t)i) * JT_GDN_TILE + (size_t)l] = (float)Sp[((size_t)tl * D + (size_t)i) * D +
+                                                                            (size_t)tile * JT_GDN_TILE + (size_t)l];
+  char name[160];
+  snprintf(name, sizeof name, "gdn_bwd_sp %s b=%d h=%d tile=%d seg=0", tag, b, h, tile);
+  CHECK_REL(name, sp_h, want, (size_t)cnt * D * JT_GDN_TILE, TOL);
+  // The same tile read straight out of the segment's checkpoint, for tl = 0: exact, sp[0] is the state before the step.
+  double worst = 0.0;
+  for (int i = 0; i < D; i++)
+    for (int l = 0; l < JT_GDN_TILE; l++) {
+      const double a = fabs((double)sp_h[(size_t)i * JT_GDN_TILE + (size_t)l] -
+                            (double)ck0[(size_t)i * D + (size_t)tile * JT_GDN_TILE + (size_t)l]);
+      if (a > worst) worst = a;
+    }
+  snprintf(name, sizeof name, "gdn_bwd_sp_ckpt %s b=%d h=%d tile=%d", tag, b, h, tile);
+  // sp[0] is the segment-0 checkpoint itself (all zeros), so this also proves the block wrote its slice: sp was
+  // garbage-filled before the launch.
+  CHECK_ABS1(name, worst, 0.0, 1e-30);
+  free(want);
+  free(Sp);
+  free(ck0);
+  free(sp_h);
+}
+
+// Every [D] row of x (n = rows * D, one row = one (token, head) GDN row) scaled to have exactly norm `target`: the shape
+// the upstream l2norm kernel gives q and k (design §3.6), so a test can use the model's magnitudes instead of a box.
+static void l2n_rows(float *x, size_t n, float target) {
+  for (size_t r = 0; r < n / D; r++) {
+    double s = 0.0;
+    for (int i = 0; i < D; i++) s += (double)x[r * D + i] * (double)x[r * D + i];
+    const float a = (float)((double)target / sqrt(s));
+    for (int i = 0; i < D; i++) x[r * D + i] *= a;
+  }
+}
+
+// One packed batch: the five gradients against ref_gdn_bwd, plus phase A's scratch. Inputs are case_fwd's (same
+// generators, same ranges, different seeds), with a cotangent dout in [-1, 1]. norm_qk renormalizes every (token, head)
+// row of q and k to the norms the model's recurrence sees -- |k| = 1 and |q| = 1/sqrt(128) after l2norm (design §3.6),
+// which is where the delta rule's write is at its largest and the test is at its least forgiving.
+static void case_bwd(const int *lens, int B, const char *tag, int sp_h, int norm_qk) {
+  if (B < 1 || B > MAXROWS) {
+    fprintf(stderr, "test_gdn: batch of %d rows; MAXROWS is %d\n", B, MAXROWS);
+    exit(1);
+  }
+  int off[MAXROWS + 1];
+  const int N = jt_ragged(lens, B, off, NULL);
+  const size_t nq = (size_t)N * (size_t)H * (size_t)D, ng = (size_t)N * (size_t)H;
+  const uint32_t seed = 9011u + (uint32_t)(B * 1000 + N);
+  char name[160];
+
+  float *q = (float *)xalloc(nq * sizeof *q), *k = (float *)xalloc(nq * sizeof *k);
+  float *v = (float *)xalloc(nq * sizeof *v), *dout = (float *)xalloc(nq * sizeof *dout);
+  float *g = (float *)xalloc(ng * sizeof *g), *beta = (float *)xalloc(ng * sizeof *beta);
+  float *dq_r = (float *)xalloc(nq * sizeof *dq_r), *dk_r = (float *)xalloc(nq * sizeof *dk_r);
+  float *dv_r = (float *)xalloc(nq * sizeof *dv_r), *dg_r = (float *)xalloc(ng * sizeof *dg_r);
+  float *db_r = (float *)xalloc(ng * sizeof *db_r);
+  float *dq = (float *)xalloc(nq * sizeof *dq), *dk = (float *)xalloc(nq * sizeof *dk);
+  float *dv = (float *)xalloc(nq * sizeof *dv), *dg = (float *)xalloc(ng * sizeof *dg);
+  float *db = (float *)xalloc(ng * sizeof *db);
+  const float qk = (float)(1.0 / sqrt((double)D));
+  rnd_fill(q, nq, -qk, qk, seed);
+  rnd_fill(k, nq, -qk, qk, seed + 1u);
+  rnd_fill(v, nq, -1.0, 1.0, seed + 2u);
+  rnd_fill(dout, nq, -1.0, 1.0, seed + 3u);
+  rnd_fill(g, ng, -1.0, 0.0, seed + 4u);
+  rnd_fill(beta, ng, 0.0, 1.0, seed + 5u);
+  if (norm_qk) { // every row to the model's own norm: |k| = 1, |q| = 1/sqrt(128)
+    l2n_rows(q, nq, (float)(1.0 / sqrt((double)D)));
+    l2n_rows(k, nq, 1.0f);
+  }
+
+  ref_gdn_bwd(B, off, H, D, D, q, k, v, g, beta, dout, dq_r, dk_r, dv_r, dg_r, db_r);
+
+  const int nseg = gdn_ckpt_segs(off, B);
+  const size_t nck = gdn_ckpt_floats(B, H, nseg);
+  const size_t nsp = gdn_bwd_sp_floats(B, H);
+  const size_t npart = gdn_bwd_part_floats((size_t)N, H), ngate = gdn_bwd_gate_floats((size_t)N, H);
+  int *off_d = (int *)dev_upload_bytes(off, (size_t)(B + 1) * sizeof *off);
+  float *q_d = dev_upload(q, nq), *k_d = dev_upload(k, nq), *v_d = dev_upload(v, nq);
+  float *do_d = dev_upload(dout, nq), *g_d = dev_upload(g, ng), *b_d = dev_upload(beta, ng);
+  float *o_d = dev_alloc(nq * sizeof *o_d), *ck_d = dev_alloc(nck * sizeof *ck_d);
+  gdn_bwd_work wk;
+  wk.sp = (float *)dev_alloc(nsp * sizeof *wk.sp);
+  wk.dq_part = (float *)dev_alloc(npart * sizeof *wk.dq_part);
+  wk.dk_part = (float *)dev_alloc(npart * sizeof *wk.dk_part);
+  wk.dbeta_part = (float *)dev_alloc(ngate * sizeof *wk.dbeta_part);
+  wk.dg_part = (float *)dev_alloc(ngate * sizeof *wk.dg_part);
+  float *dq_d = dev_alloc(nq * sizeof *dq_d), *dk_d = dev_alloc(nq * sizeof *dk_d);
+  float *dv_d = dev_alloc(nq * sizeof *dv_d), *dg_d = dev_alloc(ng * sizeof *dg_d);
+  float *db_d = dev_alloc(ng * sizeof *db_d);
+  // Garbage in every buffer the backward writes: a block that skips its segment shows up as a failed check rather than
+  // as a stale value from the batch before.
+  CK(cudaMemset(wk.sp, 0x7f, nsp * sizeof *wk.sp));
+  CK(cudaMemset(dq_d, 0x7f, nq * sizeof *dq_d));
+  CK(cudaMemset(dk_d, 0x7f, nq * sizeof *dk_d));
+  CK(cudaMemset(dv_d, 0x7f, nq * sizeof *dv_d));
+  CK(cudaMemset(dg_d, 0x7f, ng * sizeof *dg_d));
+  CK(cudaMemset(db_d, 0x7f, ng * sizeof *db_d));
+
+  // Warm-up: the first launch that writes a freshly allocated buffer is many times slower than the next one on gpubox
+  // (WSL2's driver maps the pages lazily), so the timed calls follow one full pass over the same buffers.
+  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, ck_d, o_d, 0);
+  gdn_bwd(q_d, k_d, v_d, g_d, b_d, do_d, off_d, B, H, N, nseg, ck_d, &wk, dv_d, dq_d, dk_d, dg_d, db_d, 0);
+  CK(cudaDeviceSynchronize());
+  double t0 = jt_now();
+  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, ck_d, o_d, 0);
+  CK(cudaDeviceSynchronize());
+  const double ms_fwd = 1e3 * (jt_now() - t0);
+  t0 = jt_now();
+  gdn_bwd(q_d, k_d, v_d, g_d, b_d, do_d, off_d, B, H, N, nseg, ck_d, &wk, dv_d, dq_d, dk_d, dg_d, db_d, 0);
+  CK(cudaDeviceSynchronize());
+  const double ms_bwd = 1e3 * (jt_now() - t0);
+  double ms_bwd_best = ms_bwd;
+  for (int rep = 0; rep < 3; rep++) {
+    t0 = jt_now();
+    gdn_bwd(q_d, k_d, v_d, g_d, b_d, do_d, off_d, B, H, N, nseg, ck_d, &wk, dv_d, dq_d, dk_d, dg_d, db_d, 0);
+    CK(cudaDeviceSynchronize());
+    const double ms = 1e3 * (jt_now() - t0);
+    if (ms < ms_bwd_best) ms_bwd_best = ms;
+  }
+  JT_SYNC_DEBUG;
+  if (jt_has_card())
+    printf("    gdn_bwd %-46s N=%d  fwd %.2f ms, bwd %.2f ms (one call each; bwd best of 4 warm %.2f ms)\n", tag, N,
+           ms_fwd, ms_bwd, ms_bwd_best);
+
+  dev_download(dq_d, dq, nq);
+  dev_download(dk_d, dk, nq);
+  dev_download(dv_d, dv, nq);
+  dev_download(dg_d, dg, ng);
+  dev_download(db_d, db, ng);
+  snprintf(name, sizeof name, "gdn_bwd dq %s", tag);
+  CHECK_REL(name, dq, dq_r, nq, TOL);
+  snprintf(name, sizeof name, "gdn_bwd dk %s", tag);
+  CHECK_REL(name, dk, dk_r, nq, TOL);
+  snprintf(name, sizeof name, "gdn_bwd dv %s", tag);
+  CHECK_REL(name, dv, dv_r, nq, TOL);
+  snprintf(name, sizeof name, "gdn_bwd dg %s", tag);
+  CHECK_REL(name, dg, dg_r, ng, TOL);
+  snprintf(name, sizeof name, "gdn_bwd dbeta %s", tag);
+  CHECK_REL(name, db, db_r, ng, TOL);
+  if (jt_has_card() && sp_h >= 0) check_sp(wk.sp, ck_d, k, v, g, beta, off, B, nseg, sp_h, 1, tag);
+
+  dev_free(db_d);
+  dev_free(dg_d);
+  dev_free(dv_d);
+  dev_free(dk_d);
+  dev_free(dq_d);
+  dev_free(wk.dg_part);
+  dev_free(wk.dbeta_part);
+  dev_free(wk.dk_part);
+  dev_free(wk.dq_part);
+  dev_free(wk.sp);
+  dev_free(ck_d);
+  dev_free(o_d);
+  dev_free(b_d);
+  dev_free(g_d);
+  dev_free(do_d);
+  dev_free(v_d);
+  dev_free(k_d);
+  dev_free(q_d);
+  dev_free(off_d);
+  free(db);
+  free(dg);
+  free(dv);
+  free(dk);
+  free(dq);
+  free(db_r);
+  free(dg_r);
+  free(dv_r);
+  free(dk_r);
+  free(dq_r);
+  free(beta);
+  free(g);
+  free(dout);
+  free(v);
+  free(k);
+  free(q);
+}
+
+// The same five batches as the forward, plus a uniform B = 8 at the dataset's median row length (about 520 tokens), which
+// is the shape plan M3.3 asks the one-call time for.
+static const int LEN_8P50[] = {520, 520, 520, 520, 520, 520, 520, 520};
+
 static int group_bwd(void) {
-  printf("NOT IMPLEMENTED\n");
-  return JT_NOT_IMPL;
+  case_bwd(LEN_1, 1, "B=1 {1}", 7, 0);
+  case_bwd(LEN_2, 1, "B=1 {2}", 7, 0);
+  case_bwd(LEN_3, 3, "B=3 {63,64,65}", 5, 0);
+  case_bwd(LEN_4, 3, "B=3 {200,7,130}", 0, 0);
+  case_bwd(LEN_8, 8, "B=8 {1026,520,670,300,811,455,610,702}", 3, 0);
+  case_bwd(LEN_8P50, 8, "B=8 {520 x 8}", 11, 0);
+  case_bwd(LEN_4, 3, "B=3 {200,7,130} l2n q,k", 2, 1); // the model's own |k| = 1, |q| = 1/sqrt(128)
+  return jt_exit_code();
 }
 
 // ---- dispatcher (test_kernels' contract, plan M2.0) ---------------------------------------------------------------
