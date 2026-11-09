@@ -15,7 +15,8 @@
 //
 // The layer driver is design §3.4 verbatim, split at the post-mixer residual that dump_ref.py's keys and test_layer use
 // (design §10.2): the mixer writes x_out = x_in + Mixer(RMSNorm(x_in)), the MLP adds its own path on top. Neither piece
-// keeps anything during the forward sweep; the backward recomputes each layer from its saved input (design §6.2).
+// keeps anything during the forward sweep; the backward recomputes each layer from its saved input (design §6.2, the
+// layer-level recompute — model_backward below).
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
@@ -450,15 +451,42 @@ int layer_fwd(JtCtx *c, int i, const float *x_in, int n, const JtBatch *b, float
   return layer_mlp_fwd(c, lw, post_mixer != NULL ? post_mixer : x_out, n, b, x_out, mode);
 }
 
+// ---- one layer's backward (design §4.6, §6.2, plan M5.1 item 3) ----------------------------------------------------------
+// The two halves of a layer each have a backward that reads the saves of ITS OWN forward pass from the arena's base:
+// layer_mlp_bwd binds its block at c->arena (src/layer_mlp.c's saves_bind), layer_gdn_mixer_bwd replays its walk from
+// c->arena (src/layer_gdn.c's saves_replay) and layer_attn_mixer_bwd indexes its block from c->arena too (src/layer_attn.c).
+// One layer_fwd(SAVE) puts the mixer's block at the base and the MLP's above it, so a single save half cannot serve both
+// backwards — each half is recomputed with its saves at the base, in the order the layer's maths requires: the MLP adds its
+// path to dres first (it is the last thing the forward did, design §4.6), then the mixer's dy is the accumulated value.
+//
+// `post_mixer` is the fwd's saved residual after the mixer (the MLP's input). `x_in` is the layer's input, which the
+// mixer's fwd(SAVE) is re-run from. The two recomputes' outputs are work temporaries: only the saves matter here.
 int layer_bwd(JtCtx *c, int i, const float *x_in, const float *post_mixer, float *dres, int n, const JtBatch *b) {
   const MtLayer *ml = mt_layer(i);
   if (c == NULL || ml == NULL || x_in == NULL || post_mixer == NULL || dres == NULL || b == NULL)
     die("layer_bwd: bad arguments (layer %d)", i);
   if (n != b->n) die("layer_bwd: n %d but the batch has %d tokens", n, b->n);
   const LayerWeights *lw = &c->model->layers[i];
-  int rc = layer_mlp_bwd(c, lw, post_mixer, dres, n, b); // the MLP is the last thing the forward did
-  if (rc != JT_LAYER_OK) return rc;
-  return ml->full_attention ? layer_attn_mixer_bwd(c, lw, x_in, dres, n, b) : layer_gdn_mixer_bwd(c, lw, x_in, dres, n, b);
+  const size_t mark = jt_work_mark(c);
+  float *x_out = jt_work_alloc(c, (size_t)n * MT_HIDDEN); // the recomputes' output; nothing reads it
+
+  // 1. the MLP: recompute it from its residual input into the base, then its backward (dres += the MLP's path).
+  jt_saves_reset(c);
+  int rc = layer_mlp_fwd(c, lw, post_mixer, n, b, x_out, JT_FWD_SAVE);
+  if (rc == JT_LAYER_OK) rc = layer_mlp_bwd(c, lw, post_mixer, dres, n, b);
+
+  // 2. the mixer: recompute it from the layer's input into the base, then its backward (dres += the mixer's path).
+  if (rc == JT_LAYER_OK) {
+    jt_saves_reset(c);
+    rc = ml->full_attention ? layer_attn_mixer_fwd(c, lw, x_in, n, b, x_out, JT_FWD_SAVE)
+                            : layer_gdn_mixer_fwd(c, lw, x_in, n, b, x_out, JT_FWD_SAVE);
+  }
+  if (rc == JT_LAYER_OK) {
+    rc = ml->full_attention ? layer_attn_mixer_bwd(c, lw, x_in, dres, n, b)
+                            : layer_gdn_mixer_bwd(c, lw, x_in, dres, n, b);
+  }
+  jt_work_restore(c, mark);
+  return rc;
 }
 
 int model_forward(JtCtx *c, const int *ids, int n, const JtBatch *b, float *saved_in, float *post_mixer) {
@@ -473,4 +501,80 @@ int model_forward(JtCtx *c, const int *ids, int n, const JtBatch *b, float *save
     if (rc != JT_LAYER_OK) return rc;
   }
   return JT_LAYER_OK;
+}
+
+// ---- the backward sweep (design §6.2, plan M5.1 item 4) -----------------------------------------------------------------
+// The forward kept only each layer's input (model_forward's saved_in), so the backward walks the layers in reverse and
+// re-runs each one from its saved input before differentiating it:
+//
+//   for i = 23 .. 0:   the recompute of layer i from saved_in[i], then its backward
+//                      dres:  dL/d(layer i's out)  ->  dL/d(layer i's in)
+//
+// The layer's dx is the next layer's dy: layer i's output gradient (dres on entry) becomes layer i-1's input gradient
+// (dres on return), which is why the loop needs one gradient buffer and not 24 (design §6.2's "The dx of layer i is the
+// dy of layer i-1"). Design §6.2's cost is one extra forward, and its memory is one layer's scratch, reused.
+//
+// Why this does not simply call layer_fwd(SAVE) + layer_bwd: those two are correct (layer_bwd recomputes both halves itself,
+// above) but they cost a third forward, because the mixer's save block is thrown away when the MLP's fwd(SAVE) takes the
+// arena's base. Here the mixer's block is parked in the work half instead — its size is the save cursor right after the
+// mixer's fwd(SAVE), so nothing here knows any piece's layout — and copied back before the mixer's backward, which makes
+// the sweep's recompute exactly one forward, as design §6.2 budgets. Two device-to-device copies per layer (the mixer's
+// ~24 K floats per token each way) against a saved forward pass.
+//
+// `saved_in` is model_forward's buffer (25 slabs of n * MT_HIDDEN). `post_mixer`, when not NULL, is MT_LAYERS slabs and
+// receives each layer's post-mixer residual: the mixer's fwd(SAVE) writes its output there, which IS post_mixer, so the
+// recompute produces dump_ref's `layer.{i}.post_mixer` key at no extra cost. `grad_out`, when not NULL, is MT_LAYERS slabs
+// and receives dL/d(layer i's output) as it stood on entry to layer i's backward — dump_ref's `grad.layer.{i}.out`, which
+// the backward overwrites in place and so must be copied out first. `dres` is n * MT_HIDDEN, in as dL/d(layer 23's output)
+// (head_bwd's result) and out as dL/d(the embedding's output). Both optional buffers exist for --dump-backward's keys; a
+// training step passes NULL and saves nothing (design §6.2).
+//
+// The scratch (the recompute's output, one slab for post_mixer when the caller has no buffer, and the park) comes from the
+// arena's work half and is given back before returning; each half's own saves and temporaries are bracketed by the piece
+// that takes them. No allocation happens here.
+int model_backward(JtCtx *c, const float *saved_in, int n, const JtBatch *b, float *post_mixer, float *grad_out,
+                   float *dres) {
+  if (c == NULL || c->model == NULL || saved_in == NULL || b == NULL || dres == NULL)
+    die("model_backward: bad arguments");
+  if (n != b->n) die("model_backward: n %d but the batch has %d tokens", n, b->n);
+  const size_t stride = (size_t)n * MT_HIDDEN;
+  const size_t mark = jt_work_mark(c);
+  float *x_out = jt_work_alloc(c, stride);                       // the recompute's output; nothing reads it
+  float *one_pm = post_mixer == NULL ? jt_work_alloc(c, stride) : NULL; // one post_mixer slab, reused, when nobody wants them
+  int rc = JT_LAYER_OK;
+  for (int i = MT_LAYERS - 1; i >= 0 && rc == JT_LAYER_OK; i--) {
+    const MtLayer *ml = mt_layer(i);
+    const LayerWeights *lw = &c->model->layers[i];
+    const float *x_in = saved_in + (size_t)i * stride;
+    float *lp = one_pm != NULL ? one_pm : post_mixer + (size_t)i * stride; // this layer's post-mixer residual
+    const size_t at = jt_work_mark(c);
+
+    // 1. the mixer's recompute from the layer's input, its saves at the arena's base (lp receives its output = post_mixer).
+    jt_saves_reset(c);
+    rc = ml->full_attention ? layer_attn_mixer_fwd(c, lw, x_in, n, b, lp, JT_FWD_SAVE)
+                            : layer_gdn_mixer_fwd(c, lw, x_in, n, b, lp, JT_FWD_SAVE);
+    if (rc != JT_LAYER_OK) break;
+
+    // 2. park those saves (their size is the save cursor, so no piece's layout is assumed) and hand the base to the MLP.
+    const size_t mixer_saves = c->save_at;
+    float *park = jt_work_alloc(c, mixer_saves);
+    CK(cudaMemcpyAsync(park, c->arena, mixer_saves * sizeof(float), cudaMemcpyDeviceToDevice, c->stream));
+    if (grad_out != NULL) { // grad.layer.{i}.out: the entry value, before any backward writes dres
+      CK(cudaMemcpyAsync(grad_out + (size_t)i * stride, dres, stride * sizeof(float), cudaMemcpyDeviceToDevice, c->stream));
+    }
+    jt_saves_reset(c);
+    rc = layer_mlp_fwd(c, lw, lp, n, b, x_out, JT_FWD_SAVE);
+    if (rc == JT_LAYER_OK) rc = layer_mlp_bwd(c, lw, lp, dres, n, b); // the MLP is the last thing the forward did
+    if (rc != JT_LAYER_OK) break;
+
+    // 3. the mixer's saves back at the base (and the cursor with them, which its replay checks), then its backward.
+    CK(cudaMemcpyAsync(c->arena, park, mixer_saves * sizeof(float), cudaMemcpyDeviceToDevice, c->stream));
+    jt_saves_reset(c);
+    (void)jt_save_alloc(c, mixer_saves);
+    rc = ml->full_attention ? layer_attn_mixer_bwd(c, lw, x_in, dres, n, b)
+                            : layer_gdn_mixer_bwd(c, lw, x_in, dres, n, b);
+    jt_work_restore(c, at);
+  }
+  jt_work_restore(c, mark);
+  return rc;
 }
