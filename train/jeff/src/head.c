@@ -1,5 +1,5 @@
-// src/head.c — the decision head: the final norm, the last token of each row, the readout GEMM and the soft CE (design
-// §4.1, §13; plan M4.3 item 5).
+// src/head.c — the decision head: the final norm, the last token of each row, the readout GEMM, the soft CE and their
+// backward (design §4.1, §13; plan M4.3 item 5 and M5.1 item 1).
 //
 // The forward is design §4.1 in order, with the call each step uses:
 //
@@ -16,9 +16,19 @@
 // ce_head's per-row losses, and a training step wants it on the host for its log/schedule. That makes head_fwd the one
 // layer call that synchronises; pass loss == NULL to keep the step asynchronous (the logits stay device-side).
 //
-// The backward (design §4.1's second half) is NOT written yet — head_bwd is still plan J18's stub, and plan M5.1 item 1
-// is its task. The save layout head_bwd will read is fixed here so that task does not have to change head_fwd: in
-// JT_FWD_SAVE mode the saves are taken from the arena's save half in this order, and nothing else is saved —
+// The backward is design §4.1's second half (plan M5.1 item 1), in order, with the call each step uses:
+//
+//   dR    += dlogits^T z                                      gemm(1,0) 255 x 1024 x B, beta = 1, into
+//                                                             ctx->lora->grad + readout_off (accumulated: a parameter
+//                                                             gradient belongs to the step, src/linear.h's rule)
+//   dz     = dlogits R                                        gemm(0,0) B x 1024 x 255, the transpose problem of the
+//                                                             forward's readout GEMM, over all 255 readout rows
+//   dhN[off[b+1]-1] = dz[b]                                   a zeroed dh [n][MT_HIDDEN] plus B cudaMemcpyAsync (D2D)
+//                                                             per row: the forward gathered the same rows
+//   dres   = RMSNormBackward(dhN)                             rmsnorm_bwd over all n tokens, h = x, r from the saves
+//
+// In JT_FWD_SAVE mode the forward's saves are taken from the arena's save half in this order, and nothing else is saved,
+// so a backward only has to index them from the arena's base:
 //
 //   r        [n]                     the final norm's 1/sqrt(mean(x^2)+eps), one per token
 //   z        [B][MT_HIDDEN]          the gathered last-token states (dR += dlogits^T z)
@@ -26,13 +36,21 @@
 //
 // The padding is what makes dlogits' width independent of the batch (head_bwd's frozen signature carries no HeadBatch, so
 // it cannot be told n_opts): the dead columns' dlogits is exactly 0 — their p and their target are both 0 — so the
-// padded array is the same gradient as the [B][n_opts] one, and `dz = R^T dlogits` over all 255 readout rows adds
-// nothing from them. Everything else head_bwd needs it has: x (the head's input) and r.
+// padded array is the same gradient as the [B][n_opts] one, and `dz = dlogits R` over all 255 readout rows adds
+// nothing from them. A backward therefore needs the JT_FWD_SAVE of the same x WITH targets (the "logits only" pass saves
+// no dlogits and has no gradient to propagate).
+//
+// dhN is dump_ref.py's `grad.final` — the gradient at the final norm's output, which design §10.2 lists and plan M5.1
+// item 1 tests. The frozen signature has no room for it and does not need one: dhN is the first (and only) temporary
+// head_bwd takes from the arena's work half, so for a mark read before the call it sits at
+// `ctx->arena + mark - n * MT_HIDDEN`, and jt_work_restore moves the cursor back, not the data. A test — or M5.2's
+// --dump-backward — reads those words after head_bwd returns; nothing else in the work half is that size at that
+// address, because every later allocation in a bwd starts below it.
 #include "gemm.h"
 #include "head.h" // kernels/head.h: ce_head
 #include "layer.h"
 #include "misc.h" // kernels/misc.h: jt_fill, jt_zero
-#include "norm.h" // kernels/norm.h: rmsnorm_fwd
+#include "norm.h" // kernels/norm.h: rmsnorm_fwd, rmsnorm_bwd
 #include "util.h"
 
 #include <stdio.h>
@@ -146,11 +164,50 @@ int head_fwd(JtCtx *c, const float *x, int n, const JtBatch *b, const HeadBatch 
   return JT_LAYER_OK;
 }
 
-// Still plan J18's stub: the head's backward is plan M5.1 item 1. It reads the saves head_fwd's header comment lists
-// (r [n], z [B][MT_HIDDEN], dlogits [B][MT_READOUT_OUT], in that order) and implements design §4.1's last three lines:
-// dR += dlogits^T z, dz = R^T dlogits, then dhN's last-token rows = dz and rmsnorm_bwd over all n tokens into dres.
 int head_bwd(JtCtx *c, const float *x, int n, const JtBatch *b, float *dres) {
-  (void)c, (void)x, (void)n, (void)b, (void)dres;
-  fprintf(stderr, "head: head_bwd: not implemented (plan M5.1)\n");
-  return JT_LAYER_NOT_IMPL;
+  if (c == NULL || c->model == NULL || c->lora == NULL) return head_bad("no context, model or parameter buffer");
+  if (x == NULL || b == NULL || dres == NULL) return head_bad("null argument");
+  if (b->rows < 0 || b->rows > JT_MAX_ROWS) return head_bad("b->rows outside 0..JT_MAX_ROWS");
+  if (n < 0 || b->off[b->rows] != n) return head_bad("b->off[rows] != n");
+  for (int r = 0; r < b->rows; r++) { // the head reads off[r+1]-1, so a row needs at least one token (design §7)
+    if (b->off[r + 1] <= b->off[r]) return head_bad("a row is empty (the head's last token is off[r+1]-1)");
+  }
+  if (c->lora->grad == NULL) return head_bad("the parameter buffer has no gradient array");
+  const size_t readout_need = (size_t)MT_READOUT_OUT * (size_t)MT_HIDDEN;
+  if (c->lora->readout_off + readout_need > c->lora->n_param) return head_bad("the readout is outside the buffer");
+  if (b->rows == 0 || n == 0) return JT_LAYER_OK; // nothing to propagate, and rmsnorm_bwd would launch nothing
+
+  const int B = b->rows;
+  const size_t saves_need = (size_t)n + (size_t)B * ((size_t)MT_HIDDEN + (size_t)MT_READOUT_OUT);
+  if (saves_need > c->arena_n) return head_bad("the head's saves are bigger than the arena (was head_fwd run SAVE?)");
+  // head_fwd(SAVE)'s saves, in its order from the arena's base (the header comment).
+  const float *r = c->arena;
+  const float *z = r + (size_t)n;
+  const float *dlogits = z + (size_t)B * (size_t)MT_HIDDEN;
+  const float *R = c->lora->param + c->lora->readout_off; // [MT_READOUT_OUT][MT_HIDDEN], torch layout [out, in]
+
+  const size_t mark = jt_work_mark(c);
+  float *dh = jt_work_alloc(c, (size_t)n * (size_t)MT_HIDDEN); // dL/d(final) == grad.final; taken FIRST (see above)
+  float *dz = jt_work_alloc(c, (size_t)B * (size_t)MT_HIDDEN);
+
+  // 1. dR += dlogits^T z: the readout's gradient, accumulated into the flat buffer's readout slot (design §4.1).
+  gemm(c->cublas, 1, 0, MT_READOUT_OUT, MT_HIDDEN, B, 1.0f, dlogits, z, 1.0f, c->lora->grad + c->lora->readout_off);
+
+  // 2. dz = dlogits R over all 255 readout rows (the transpose problem of the forward's gemm(0,1)).
+  gemm(c->cublas, 0, 0, B, MT_HIDDEN, MT_READOUT_OUT, 1.0f, dlogits, R, 0.0f, dz);
+
+  // 3. dhN: zero over every token, then dz row b at that row's last token — the rows head_fwd gathered from.
+  jt_zero(dh, (size_t)n * (size_t)MT_HIDDEN, c->stream);
+  const size_t row_bytes = (size_t)MT_HIDDEN * sizeof(float);
+  for (int r2 = 0; r2 < B; r2++) {
+    const size_t last = (size_t)(b->off[r2 + 1] - 1);
+    CK(cudaMemcpyAsync(dh + last * MT_HIDDEN, dz + (size_t)r2 * MT_HIDDEN, row_bytes, cudaMemcpyDeviceToDevice,
+                       c->stream));
+  }
+
+  // 4. the final norm's backward over all n tokens, in full: this is the start of the backward sweep (src/layer.h).
+  rmsnorm_bwd(x, c->model->final_norm, dh, r, dres, n, MT_HIDDEN, 1, c->stream);
+  JT_SYNC_DEBUG;
+  jt_work_restore(c, mark); // dh and dz are gone as allocations; their words stay readable (the grad.final note above)
+  return JT_LAYER_OK;
 }
