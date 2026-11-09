@@ -1,7 +1,9 @@
 # jefftrain: a C/CUDA LoRA trainer for Jeff on the macuda shim. Design
 
-Status: design, not yet written. Companion: `jeff-trainer-plan.md` (the step-by-step coding plan with test gates).
-Written 2026-11-08.
+Status: implemented and corrected against the built tree. Companion: `jeff-trainer-plan.md` (the step-by-step coding
+plan with test gates; its Appendix B carries the measured numbers). Written 2026-11-08; the sections marked
+*as built* below were reconciled with `train/jeff/` and its `notes/` afterwards, because several of the original
+estimates (the GDN backward's cost, the `.jtb` header's contents, the TF32 gate) did not survive contact.
 
 ## 1. What this is and why
 
@@ -142,10 +144,16 @@ layers.{i}.linear_attn.A_log  [16]   dt_bias [16]
 layers.{i}.linear_attn.norm.weight        [128]            NOT zero-centred (plain multiply, init ones)
 ```
 
-Plus `readout.safetensors`: `weight` [255,1024] BF16. Everything else in the file (visual.*, mtp.*) is skipped. The
-safetensors reader is about 80 lines of C: an 8-byte little-endian header length, a JSON header (`dtype`, `shape`,
-`data_offsets` relative to the end of the header), then raw little-endian data. mmap the file, parse the JSON with a
-tiny hand-written scanner (the header is flat: name → {dtype, shape, data_offsets}), and look up by name.
+Plus `readout.safetensors`: `weight` [255,1024] BF16. Everything else in the file (`visual.*`) is skipped — and note
+that the checkpoint this was checked against has **no `mtp.*` tensor at all** (473 tensors = 320 text + 153 visual +
+the readout); the skip rule is right, the mention of `mtp.*` is not backed by the file. The safetensors reader is
+small in code but not naive: an 8-byte little-endian header length, a JSON header (`dtype`, `shape`, `data_offsets`
+relative to the end of the header), then raw little-endian data. mmap the file, parse the JSON with a tiny hand-written
+scanner (the header is flat: name → {dtype, shape, data_offsets}), and look up by name. *As built* `src/st.c` is ~800
+lines, not "about 80": it validates rather than trusts (dtype, `data_offsets` against the shape, duplicate names, junk
+after the JSON, shard completeness, one message per failure naming both sides), which is what the loader needs. Its
+shape array is `ST_MAX_DIMS 8`, not 4, because `visual.patch_embed.proj.weight` is `[768,3,2,16,16]` and the reader
+registers every tensor in the header (that is what makes `--list` show `visual.*`).
 
 ### 3.3 Building blocks
 
@@ -423,6 +431,14 @@ How it relates to the Python CUDA run: Python runs under bf16 autocast, so its G
 to bf16. jefftrain v1 is closer to the fp32 reference than the Python bf16 run is. Parity is measured against both
 (section 10), each with its own threshold.
 
+**As built, TF32 is the speed mode, not the parity mode.** Every activation and gradient gate (10.2, M5.1, M6.2, M7.3)
+runs with `JT_EXACT=1 TINYCUBLAS_TC=0`, because this model's 24-layer backward amplifies a relative perturbation by
+about 1e21: a 1e-6 nudge to one entry of the last layer's incoming gradient reaches layer 0 at O(1e20) while the true
+gradient rides a stable direction, so in TF32 the early layers' gradients are noise by construction (the same 403-key
+dump gives `87 ok, 316 failed`). A 1e-4-level difference between jefftrain and a reference is therefore only meaningful
+in exact mode; TF32 is what M6.3's timing, M6.4's arm and the card checkpoints' m1/m2/m3 steps use, and gradient
+clipping and Adam inherit the noise if a training run is done in it.
+
 ### 6.2 Memory plan (target: fits a 12 GB card)
 
 Layer-level recompute (the same thing as `--grad-checkpoint`): the forward keeps only each layer's input x (fp32
@@ -458,6 +474,11 @@ back. A small host array `off[b]` (prefix sums, off[B] = N) is copied to the dev
     [off[b], off[b+1]).
   * Attention: done per row (`gemm_batched` on the row's slice), so the mask is just causal within the row.
   * RoPE positions are `t_local` (0-based within the row), never the packed index.
+  * The q/k/v slices of the conv output are **copied**, not viewed: `kernels/norm.h`'s l2norm takes `rows, d` and
+    `kernels/gdn.h`'s `gdn_fwd` indexes `((t*H) + h)*D`, and neither takes a row pitch, so `layer_gdn.c` gets its three
+    contiguous `[n][2048]` slices from `jt_to_head_major(…, heads = 3, head_dim = 2048)` — one pass over the same
+    `3·N·2048` floats the l2norm and the recurrence read anyway. A strided view of `[N][6144]` would need a pitch
+    parameter in both kernels.
 * The head reads token `off[b+1]-1` for row b.
 
 Python's right-padding gives identical numbers: pads sit after the last real token, and causality means no real
@@ -476,11 +497,11 @@ cudaMemcpyToSymbol in the shim; pass tables as pointers).
 | kernel | what | launch |
 |---|---|---|
 | embed_gather | out[t,:] = float(bf16 table[id[t],:]) | grid N, block 256 |
-| bf16_to_f32 | weight conversion at load | 1-D grid-stride |
-| rmsnorm_fwd(d, zero_centred) | y and r per row (r saved) | one block per row; block-reduce sum of squares |
-| rmsnorm_bwd | 4.3 | one block per row; two reductions |
-| gated_rmsnorm_fwd/bwd | 4.4, rows = N x 16 heads, d = 128 | one warp per (token, head) |
-| l2norm_fwd/bwd | rows = N x 16, d = 128; saves r | one warp per (token, head) |
+| bf16_to_f32 | weight conversion at load (as built: `jt_bf16_to_f32_n`, `_n` because the test harness owns a scalar `jt_bf16_to_f32`) | 1-D grid-stride |
+| rmsnorm_fwd(d, zero_centred) | y and r per row (r saved) | one block per row for d > 256; one warp per row for d ≤ 256 (q_norm/k_norm) |
+| rmsnorm_bwd | 4.3 (**one** row reduction, `mean(gy*x)`: `r` is taken as an input, not recomputed) | one block per row |
+| gated_rmsnorm_fwd/bwd | 4.4, rows = N x 16 heads, d = 128 | one warp per row, 8 warps (256 threads) per block, grid = ceil(rows/8) |
+| l2norm_fwd/bwd | rows = N x 16, d = 128; saves r | same shape as gated_rmsnorm |
 | silu_mul_fwd/bwd | MLP gating | grid-stride |
 | sigmoid_gate_fwd/bwd | attention output gate, interleaved layout (3.5) | grid-stride |
 | rope_fwd/bwd | first 64 dims of each 256-dim head; positions from row_of/off | one thread per (token, head, j<32) |
@@ -492,7 +513,12 @@ cudaMemcpyToSymbol in the shim; pass tables as pointers).
 | ce_head | 4.1 for B rows: softmax over n live options, loss, dlogits | one block per row |
 | add_inplace, scale, zero | residuals and bookkeeping | grid-stride |
 | adamw_step | 2.2, one launch over a flat parameter buffer with a per-element lr group | grid-stride |
-| sumsq | for the global grad norm: per-block partial sums then a second pass on 1 block (deterministic) | |
+| sumsq | for the global grad norm: `sumsq_partial` + `sumsq_final` over a fixed 1024 blocks (deterministic); returns the **sum of squares**, the caller takes the root | |
+
+The row-structured ops (`qgate_*`, `kv_*`, `to/from_head_major`) launch one block per row (or per head) *strided over
+rows* rather than as a flat grid-stride: inside a row the block walks heads and columns with `for` loops, so no thread
+divides an index and a large packed batch cannot overrun the grid's x limit. Every wrapper is a no-op for a zero
+dimension, so no caller special-cases an empty slice.
 
 Keep all LoRA A, B and the readout in ONE flat fp32 buffer (and grads, m, v in three more of the same layout), with a
 host-side table of offsets. That makes zeroing, the grad norm, clipping and Adam each one launch, and saving a flat
@@ -531,7 +557,12 @@ Inputs in [N,16,128] (q already l2-normed and scaled, k l2-normed, v) and [N,16]
 
 **Forward kernel `gdn_fwd`.** Grid (B rows, 16 heads, 4 column tiles); block 32 threads (one warp). Lane l owns value
 column j = tile*32 + l and keeps that column of S, `float s[128]`, in registers. Loop with `#pragma unroll` over i
-so the array stays in registers; check `-Xptxas -v` / cuobjdump for zero spill. Per token t of the row:
+so the array stays in registers; check `-Xptxas -v` / cuobjdump for zero spill. *As built* one unrolled 128-iteration
+loop does **not** stay in registers (255 registers, 68 B spill stores / 52 B loads: ptxas prefetches all 128 shared
+loads of the sum); each 128-iteration loop is split into **two 64-iteration halves with a `__syncwarp()` between**,
+which is a scheduling barrier ptxas cannot move loads across and costs only the instruction. That is **201 registers,
+0 bytes spill stores, 0 bytes spill loads, 1024 B smem**, with the sums still running i = 0…127 ascending, so the
+arithmetic is unchanged. Per token t of the row:
 ```
 smem k_s[128], q_s[128] ← k[t,h,:], q[t,h,:]   (each lane loads 4 of each; __syncwarp())
 e = expf(g[t,h]);  kv = 0
@@ -543,6 +574,12 @@ out[t,h,j] = o
 ```
 No cross-lane reduction at all, because columns are independent (3.6). Checkpoint: when t_local % 64 == 0, before
 the step, write s[] into `ckpt[b][h][t_local/64][i][j]`. Checkpoints per (b,h) = ceil(max_len/64), 64 KB each: 17 at max_len 1026.
+*As built* the buffer is the **caller's** — `gdn_fwd(…, int nseg, float *ckpt, float *o, cudaStream_t s)` — because
+the backward is a separate call that reads it and there is no global scratch; `kernels/gdn.h`'s `gdn_ckpt_segs()` /
+`gdn_ckpt_floats()` are the only place its size is written down, and `ckpt == NULL` (or `nseg <= 0`) means
+"forward only, no stores". At B = 8 / N = 5094 it is 142.6 MB and costs nothing measurable (1.26 ms with, 1.25–1.33 ms
+without). The forward's measured cost is **1.26 ms** for that batch, so the "about 2 ms per layer for fwd + bwd"
+budget below leaves the backward 0.7 ms, which it does not meet — see the correction at the end of this section.
 
 **Backward kernel `gdn_bwd`.** Grid (B, 16, 4 tiles); block 64 threads = 2 warps. Warp w owns rows
 i in [64w, 64w+64); lane l owns column j = tile*32 + l. Each thread holds `float ds[64]` (its piece of dS) across
@@ -573,7 +610,8 @@ ds_i *= e
 ```
 The "sum over lanes" for a vector of 64 rows: for each of the 64 values, 5 `__shfl_xor_sync` steps; lane 0 then
 holds all 64 sums (every lane does, in fact). Lane 0 of warp w writes dq rows [64w, 64w+64). That is 640 shuffles per
-token per thread, well within budget (about 2 ms per layer on a 5090 at batch 8).
+token per thread, well within budget (the estimate here was "about 2 ms per layer on a 5090 at batch 8"; the measured
+cost is 11.6 ms, and the reason is this section's `sp` traffic — see the correction at the end of 8.3).
 
 Output partials: dq_part, dk_part [4 tiles][N][16][128]; dbeta_part, dg_part [4][N][16]. A reduce kernel adds the 4
 tiles in order 0,1,2,3, so the result is deterministic. dv needs no reduction (each column belongs to one tile).
@@ -581,6 +619,26 @@ tiles in order 0,1,2,3, so the result is deterministic. dv needs no reduction (e
 Correctness gates for the kernel (plan, M3): fwd vs gdn_ref on random inputs, L = 1, 2, 63, 64, 65, 200, B = 3 with
 different lengths, max abs error < 1e-4 relative to the output's max; bwd vs gdn_ref the same; gdn_ref's backward vs
 finite differences in double precision on L = 5, dims shrunk to 8 (the ref takes dims as parameters for exactly this).
+
+**As built, and the cost correction.** `gdn_bwd_kernel` is grid `(B, 16, 4)`, block 64 = 2 warps, **168 registers,
+0 bytes spill stores, 0 bytes spill loads, 256 B smem**, plus a 4-tile reduce kernel (28 registers) that sums tiles
+0,1,2,3 in that order. Neither fallback above was needed: `sd[64]` fits beside `ds[64]`, so `sp` is read **once** per
+token, and 64 rows per warp fits, so **the 4-warp variant is not needed** either. Worst gradient error against
+the reference is 3.77e-07 (gate 1e-4).
+
+The budget line "about 2 ms per layer for fwd + bwd" is **wrong for this structure**, and the reason is this section's
+own `sp` scratch: phase A writes S_prev for every token (4096 floats per block per token = 16 KB, and a token is
+covered by 4 tiles x 16 heads = 64 blocks, i.e. **1 MB per token**), so at N = 5094 that is 5.3 GB written and 5.3 GB
+read, plus the 4-tile `dq_part`/`dk_part` partials (668 MB each: 1.3 GB written, 1.3 GB read, 334 MB final) — about
+**13 GB of traffic per call**. On a 5090 (1.79 TB/s) the floor is 7.3 ms and the kernel measures **11.6 ms** (63% of
+peak; a plain copy reaches ~85%); a 4090 gives a 13.0 ms floor and 15.99 ms (81%). A whole GDN layer is therefore
+**12.9 ms on gpubox and 17.3 ms on the card** at B = 8 / N = 5094, not 2 ms. No kernel that stores S_prev for every
+token can meet 2 ms — 10.7 GB in 0.7 ms would need 15 TB/s — so the next 4x is either keeping a segment's `sp`
+resident (8 tokens is 128 KB per block, 64 MB across 512 blocks in L2) or a rolling shared-memory window replayed from
+the checkpoint per chunk (~25% more phase A work). Both change this section's `sp[tl][64][128][32]` layout, which is
+why v1 did not do it; it is M8's chunked GDN, with `gdn_bwd_sp_floats()`/`gdn_bwd_part_floats()` in
+`kernels/gdn.h` the only place a buffer size is written down. Memory for it: 1.99 GB of backward scratch at B = 8 /
+N = 5094 (ckpt 142.6 MB + `sp` 512 MB + two 668 MB partials + gates 1.3 MB each).
 
 The fla chunked algorithm (WY form, GEMM-based) is faster and is the M8 optimisation. It does not belong in v1.
 
@@ -603,10 +661,21 @@ strings: row ids as NUL-terminated UTF-8 (for writing predictions keyed by id)
 ```
 Little-endian, no padding between sections, a section-offset table right after the header (u64 x 5). The C reader
 validates the magic, version, every offset against the file size, and that every token id < 248320 and every n_opts
-≤ 255.
+≤ 255 — and more: the sums against the section sizes, `max_len`/`max_opts`/`max_tokens_per_batch` against the rows'
+actual maxima, `teacher_top < n_opts`, targets in [0,1] summing to 1 (±1e-3), every id NUL-terminated, and every batch
+non-empty, in range, duplicate-free and covering the rows.
 
-The flags mirror train.py's: `--targets`, `--weights`, `--weight-cap`, `--batch`, `--accum` (written into the
-header so jefftrain can check its own flags match), `--epochs`, `--train-rows`, `--dev-rows`, `--seed`. The same seed
+Two things the header cannot carry, settled as built: `id_offset_in_strings` is **relative to the start of the strings
+section**, and the header's maxima are the file's **actual** maxima. And the header has **no room for
+`--batch`/`--accum`/`--epochs`** — six u32 words and a five-entry offsets table is all there is — so prep.py does not
+write them into it. Instead it writes `<split>.prep.json` beside each `.jtb`, with the arguments that shaped the file
+(`batch`, `accum`, `epochs`, `eval_batch`, `targets`, `weights`, `weight_cap`, `source`, `row_weights`, `tokens`, a
+header echo, and `rows_per_batch`: one row count per batch, every epoch, in file order). That sidecar is what jefftrain
+checks its own flags against (plus `n_batches == ceil_div(n_rows, batch) * epochs`), and it is why a shuffled short
+batch in the middle of an epoch is not a mismatch.
+
+The flags mirror train.py's: `--targets`, `--weights`, `--weight-cap`, `--batch`, `--accum` (recorded in the sidecar
+above, not in the header), `--epochs`, `--train-rows`, `--dev-rows`, `--seed`. The same seed
 gives the same rows, weights and order as `train.py`. prep.py calls `random.Random(seed)` in the same sequence
 train.py does: train subset, dev subset, then per-epoch `batches(train, batch, rng, shuffle=True)` with the rng
 seeded once. Read train.py `main()` and reproduce the call order exactly. A unit test compares prep.py's epoch-1
@@ -623,7 +692,10 @@ into macuda. Tests in macuda use synthetic fixtures only: random token ids, rand
   stems against a Python-written adapter (the key set must match exactly).
 * `adapter/readout.safetensors`: `weight` [255,1024]. Python saves it fp32 (readout is fp32 there); do the same.
 * `adapter/adapter_config.json`: `{"format": "anemll-jeff-lora-1", "rank": 16, "scale": 2.0, "layers": 150,
-  "step": ..., "dev_soft_ce": ..., "base": ..., "targets": ..., "weights": ...}`.
+  "step": ..., "dev_soft_ce": ..., "base": ..., "targets": ..., "weights": ...}`. As built this one file is still
+  written with a few lines of `fprintf` in `src/lora.c`, not by `src/json.c` — `json.c` owns `report.json`,
+  `pred-*.jsonl` and `--trace-loss`, and moving the adapter config there is a cosmetic follow-up, not a behaviour
+  difference.
 * `pred-<name>.jsonl`: `{"id": ..., "probs": {"A": p, ...}}` per row, in input order, probabilities rounded to 6
   decimals, keyed by the question's criteria keys. prep.py stores each row's keys in the strings section after the
   id, NUL-separated and terminated by an empty string.
@@ -631,6 +703,10 @@ into macuda. Tests in macuda use synthetic fixtures only: random token ids, rand
   best_dev_soft_ce, eval_<name>, peak_gb).
 * Log lines in train.py's format (`  step N/T  X.XXs  loss ...`), so `tools/jeff_lora/cuda/timing.sh` can parse
   jefftrain's log as is.
+* `--trace-loss FILE`: one JSON line per optimizer step, `{"step": k, "row": [row indices], "ce": [per-row soft CE]}`,
+  in batch order (the group's batches in file order, each batch's rows in file order), with `--accum k` covering the
+  whole group. The per-row CE is computed on the host from the step's fp32 logits (double `-Σ t·log softmax`), because
+  `head_fwd` only hands back the weighted batch sum. This is what section 10.3.2's comparison reads.
 
 The safetensors writer: build the JSON header (keys sorted, `{"dtype":"F32","shape":[..],"data_offsets":[a,b]}`),
 pad it with spaces to a multiple of 8 bytes, write the u64 length, the header, then the data.
@@ -656,17 +732,37 @@ public model; the weights are fine to read in tests but never get copied into ma
 Loads jeff-base in fp32 on CPU with `attn_implementation="eager"`, and replaces the GDN rule with a literal torch
 loop of section 3.6's recurrence (the same algorithm jefftrain implements, so the tightest oracle; and on gpubox, where
 fla is installed, transformers' hub-kernel decorators could otherwise route even a CPU run to fla). A call counter
-asserts the replacement ran 18 times per forward. It attaches LoRA through CLM-8B's `lora.py`, loads an
+asserts the replacement ran 18 times per forward. *As built it also replaces `modeling_qwen3_5.causal_conv1d_fn` with
+a literal conv* (section 3.6's taps), 18 calls asserted as well: `causal_conv1d` is installed on gpubox and its
+hub-kernel decorator routes it to a CUDA-only custom op, so a CPU dump otherwise dies with
+`Expected x.is_cuda() to be true`. It attaches LoRA through CLM-8B's `lora.py`, loads an
 adapter (`--init-adapter`; for tests, one written by `py/make_adapter.py` with A random and B random * 1e-2, so the
 LoRA path is not zero), and runs one forward+backward on a batch of 2 synthetic rows (lengths 37 and 70, random ids,
-n_opts 5 and 12, random targets). Forward hooks save each decoder layer's output; `retain_grad()` on them gives the
-gradients. It writes `ref.safetensors` with: `in.ids`, `in.off`, `layer.{i}.out` [N,1024], `final` [N,1024],
-`layer.{i}.in` [N,1024], `logits` [2,255], `loss`, `grad.layer.{i}.out`, `grad.final`, `grad.{stem}.lora_A/B` for all 150 layers, and `grad.readout`.
+5 and 12 live options, random targets). Forward hooks save each decoder layer's output; `retain_grad()` on them
+gives the gradients. It writes `ref.safetensors` with: `in.ids` (packed, i32), `in.off`, `layer.{i}.out` [N,1024],
+`layer.{i}.in` [N,1024], `layer.{i}.post_mixer` [N,1024] (the residual right after the mixer, i.e. the input of
+`post_attention_layernorm`, so a mixer and an MLP can be gated separately), `final` [N,1024], `logits` [B, live options],
+`loss`, `grad.layer.{i}.out`, `grad.final`, `grad.{stem}.lora_A/B` for all 150 layers, and `grad.readout` — 403 keys.
+
+Two shape facts any comparison has to respect. `logits` is `[B, widest row's live option count]`, not `[B,255]`:
+train.py's `option_logits` slices with `[:, :live.shape[1]]`, and the dead columns are `-1e9`, exactly. That also makes
+`grad.readout`'s dead rows exactly zero, and it weakens `compare_layers`' logits metric (the `-1e9` sets `max|b|`), so
+read the live columns separately if the number has to mean something. `ref.safetensors` has **no `grad.layer.0.in`** —
+layer 0's input-side gradient needs either a patched dump (one more `retain_grad` on `text.layers[0]`, which reproduces
+the other 403 keys bit for bit) or the directional finite difference used for the attention layers.
+
+One more format detail on jefftrain's side of the comparison: `st_write` is F32-only, so `--dump-forward`'s `in.ids`
+and `in.off` are written as F32 even though the reference stores them i32. Every id is below 248320 and every offset
+below the token count, all exact in fp32, and `compare_layers.py` compares by value (`to(int64)` on both), so the check
+is still exact — but a reader that types the tensors will see the difference.
 
 With the literal GDN loop, the reference runs the same algorithm as jefftrain in fp32 on CPU; only the summation order
 inside GEMMs and reductions differs. Gate: per tensor, `max|a-b| / max(|b|) < 1e-3` for activations and `< 5e-3` for
 gradients, with jefftrain built `-DJT_EXACT=1` and `TINYCUBLAS_TC=0`. With TF32 on, loosen to 2e-2 and 5e-2. That
-is a smoke check only; the exact build is the gate.
+is a smoke check only; the exact build is the gate (and for gradients it is the only meaningful mode at all — see 6.1).
+One key-set consequence: a forward-only dump has 77 keys, so a comparison against the full 403-key file reports the
+326 `grad.*` keys as missing. Use a forward-only extract for the forward checkpoint (`checkpoint m4`), and
+`--dump-backward` (all 403 keys) for the backward one.
 
 ### 10.3 End to end, on gpubox (real nvcc, real cuBLAS)
 
@@ -677,7 +773,17 @@ is a smoke check only; the exact build is the gate.
    step 20 within 2e-3.
 3. **Run parity.** One full soft arm, jefftrain vs the Python bf16 arm: dev soft CE at the chosen step within 0.01,
    test soft CE within 0.02, `score.py` metrics within noise (same arm, two Python seeds give the noise band; run
-   seed 1 too).
+   seed 1 too). *As built the band is taken over all four runs of the arm* — both Python seeds and both jefftrain seeds —
+   which is the definition the user chose after seeing the Python-only band reject seed 0 at 6 of 15 metrics. Read that
+   table knowing a member-vs-member difference cannot exceed a band that contains both members: the informative parts
+   are which implementation contributes more spread (jefftrain on 4 of 15) and whether the means' gap is inside it.
+   `scripts/arm.sh` still builds its band from the Python runs only, so the four-run table is not reproducible from the
+   script alone; that is an open follow-up. The other known difference in the trainer: `arm.sh` starts from
+   `make_adapter.py`'s fresh adapter (A random, B ~ N(0,1)·1e-2) where train.py starts at B = 0.
+
+Measured (section 10.3, all three): eval max |dp| 0.0014 TF32 / 0.0015 exact with argmax 160/160; 20 steps worst
+step-mean difference 1.18e-03 at step 7 and dev soft CE within 2.70e-04; run parity PASS, 15/15 metrics inside the
+four-run band with both CE gates at 0.00072/0.00130 (seed 0) and 0.00607/0.01170 (seed 1).
 
 ### 10.4 On the shim (Mac + eGPU)
 
@@ -686,6 +792,12 @@ kernels, then the forward and backward against `dump_ref.py`, at the same gates 
 Whole-trainer gates, at the end: 10.3.1 (eval parity, 160 rows) and 10.3.2 (20 steps), comparing
 with the gpubox jefftrain numbers. Expect near-identical (same kernels; cuBLAS vs tinycublas GEMM order is the only
 difference). Then one full arm, timed.
+
+Measured on card B (RTX 4090, `ARCH=sm_89`, shim): eval parity **max |dp| 0.0011** against gpubox jefftrain (9x inside
+the 0.01 gate), argmax 160/160; 20-step parity worst **1.17e-03** (gate 1e-2) and **5.44e-05** per row against the
+gpubox binary; the full arm was not run — at 8.94 s/step it is ~9 h on the card. The layer-level checkpoint numbers are
+2-7x the gpubox ones (m4 `final` 4.572e-06 vs 2.104e-06, m5 worst 2.345e-05 vs 1.205e-05), i.e. a different
+summation order, not a layout error.
 
 ## 11. Build and run
 
@@ -712,7 +824,7 @@ Source rules that keep both builds working:
 * Dynamic shared memory over 48 KB needs `cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, n)`
   (in the shim). The v1 kernels above stay under 48 KB, so they don't need it.
 
-`make shim` details, all from `cuda-shim/Makefile` and `build/tinycc`:
+`make shim` details, all from `cuda-shim/Makefile` and `build/tinycc`, *as built*:
 ```
 CC       = /opt/homebrew/opt/llvm/bin/clang
 MACUDA   ?= $(HOME)/Downloads/vfio/macuda          # the main checkout: a worktree has no git-ignored shim build or headers
@@ -720,13 +832,28 @@ SDK      = $(shell sh $(MACUDA)/cuda-shim/build/sdk.sh)
 CUDA_INC = $(MACUDA)/cuda-shim/cuda-13/include
 SHIM     ?= $(MACUDA)/cuda-shim/build/shim            # or build/shim-sm_89 for the Ada card; must match TINYCC_ARCH
 CFLAGS   = -isysroot $(SDK) -std=c11 -O2 -g -Wall -Wextra -I$(CUDA_INC) -Isrc
-kernels: TINYCC_GGML_MAC=$(abspath .) TINYCC_ARCH=$(ARCH) sh $(MACUDA)/cuda-shim/build/tinycc kernels/X.cu -o build/shim/X.o
+kernels: cp kernels/X.cu kernels/.tc_<cksum-of-$PWD>_X.cu
+         TINYCC_GGML_MAC=$(abspath .) TINYCC_ARCH=$(ARCH) TINYCC_SYSROOT=$(SDK) /usr/bin/lockf /tmp/jefftrain-tinycc.lock \
+             sh $(MACUDA)/cuda-shim/build/tinycc kernels/.tc_<cksum>_X.cu -o build/shim/X.o \
+             -I$(abspath {src,kernels,ref,test}) -DJT_SHIM
+         rm -f kernels/.tc_<cksum>_X.cu
 link:    $(CC) $(CFLAGS) build/shim/*.o src/*.c $(SHIM)/libtinycudart.a $(SHIM)/libtinycublas.a $(SHIM)/nv/libtinynv.a \
              /opt/homebrew/opt/llvm/lib/libLLVMDemangle.a -lc++ -lm -o build/shim/jefftrain
 ```
+The staging copy is what makes parallel worktrees safe: the `.cu` gets a name unique to the checkout (the `cksum` of its
+absolute path), so neither the container's `/ggml` mount nor the `/tmp/tinycc_*.fatbin` file tinycc derives from it can
+collide with another task's build, and the copy is removed again even on failure (`.gitignore` covers `kernels/.tc_*`
+anyway). The `lockf` serialises concurrent kernel compiles from `make -j8`, which would otherwise race on that mount.
 `TINYCC_GGML_MAC` must be a directory that contains the `.cu` source: tinycc mounts it read-only at `/ggml` in the
 container, or expects it synced at `$TINYCC_GGML_LINUX` on the ssh host. Point it at `train/jeff`. `ARCH` is the
-card's: `sm_120a` for the 5090, `sm_89` for the Ada card (with `SHIM=$(MACUDA)/cuda-shim/build/shim-sm_89`). Ask which card the run is for; don't guess.
+card's: `sm_120a` for the 5090, `sm_89` for the Ada card (with `SHIM=$(MACUDA)/cuda-shim/build/shim-sm_89`). Ask which
+card the run is for; don't guess. Each build directory records the arch (`build/shim/.arch`, `build/nv/.arch`) and
+drops its objects when it changes — without that, switching cards silently ran the previous card's cubin.
+
+The device half of a shim build is a container's nvcc (CUDA 13.0.3, one `--fatbin` per TU) and the host half Homebrew
+clang; `cuda-shim/build/container-runtime.sh` prefers Apple's `container` CLI when it is installed, so a stopped Docker
+daemon does not block the build. The shim build carries no `-DJT_EXACT`: exact mode comes from the environment
+(`JT_EXACT=1 TINYCUBLAS_TC=0`), so one build serves both modes.
 
 ### 11.2 Running on the card
 
@@ -742,11 +869,16 @@ one such run per checkpoint, so one OK covers the checkpoint.
 
 ### 11.3 gpubox
 
-`train/jeff/scripts/gpubox-sync.sh` rsyncs `train/jeff/` to `gpubox:~/macuda-train/jeff/` (no data, no weights);
-`gpubox-build.sh` runs `make nv` there; the parity scripts run `build/nv/jefftrain` against
-`~/models/jeff-base` and CLM-8B's `.jtb` files under `~/CLM-8B/data/`. The PyTorch reference venv is
-`~/CLM-8B/.venv-cuda` (torch 2.8.0+cu128, fla 0.5.2), already set up and checked (VERDICT OK, PARITY OK on
-2026-11-08).
+`train/jeff/scripts/gpubox-sync.sh` rsyncs `train/jeff/` to `gpubox:~/$JT_REMOTE/` (no data, no weights);
+`gpubox-build.sh` runs `make nv` there; the parity scripts run `~/$JT_REMOTE/build/nv/jefftrain` against
+`~/models/jeff-base` and CLM-8B's `.jtb` files under `~/CLM-8B/data/`. `JT_REMOTE` defaults to `macuda-train/jeff`;
+**export it before every call** (`export JT_REMOTE=macuda-train/wt-J34`) so parallel tasks never rsync `--delete` or
+`make nv` over one tree. `~/macuda-train/ref/` is read-only. The PyTorch reference venv is `~/CLM-8B/.venv-cuda`
+(torch 2.8.0+cu128, fla 0.5.2), already set up and checked (VERDICT OK, PARITY OK on 2026-11-08).
+
+One trap: `rsync -a` restores the *source's* mtime, so a file re-synced after a build can look older than its object
+and `make` will happily keep the stale one. `rm -rf build` (or `make -B`) after every sync that changed a file — a
+re-synced experiment once left a mutated binary in place and reported the mutation's own numbers.
 
 ## 12. The shim's API surface (what jefftrain may call)
 
@@ -765,7 +897,11 @@ From `nm` on `build/shim-sm_89/libtinycudart.a` and `libtinycublas.a`, 2026-11-0
   cublasSetMathMode, cublasSetWorkspace_v2, cublasGetStatusString, cublasGemmEx, cublasGemmBatchedEx,
   cublasGemmStridedBatchedEx, cublasSgemm_v2, cublasSgemmBatched, cublasSgemmStridedBatched, cublasStrsmBatched.
   jefftrain uses only cublasGemmEx and cublasGemmStridedBatchedEx for math. Plan M1.2a checks that the strided-batched
-  entry point accepts COMPUTE_32F_FAST_TF32 with fp32 A/B/C on the shim, as GemmEx does.
+  entry point accepts COMPUTE_32F_FAST_TF32 with fp32 A/B/C on the shim, as GemmEx does — and it does: card B's m1
+  checkpoint printed `GEMM OK 112/112` in both modes with no `NOT_SUPPORTED`. As built the whole tree needs **24**
+  cuda*/cublas* symbols (`make check-symbols`), all defined by the shim archives: the count grew from 10 at M0 to 15 at
+  M1 (the five cuBLAS entries), 17 at M2.6 (`_cudaMemsetAsync`, `_cudaMemGetInfo`), and 23 by M4.3–M5, with 24 after
+  `--trace-loss`'s host pulls. Nothing in `src/` or `kernels/` had to move to a different API to get there.
 
 **Missing, do not use:** cudaLaunchKernel, cudaStreamCreate, cudaEventCreate, cudaEventElapsedTime (time on the host
 with `clock_gettime(CLOCK_MONOTONIC)` after `cudaDeviceSynchronize`), cudaMemcpyToSymbol, cudaMallocAsync,
@@ -778,39 +914,61 @@ After every kernel launch in debug builds (`-DJT_DEBUG=1`), `CK(cudaGetLastError
 
 ```
 train/jeff/
-  Makefile                 targets: nv, shim, test-cpu, check-symbols, clean
+  Makefile                 targets: nv, shim, test-cpu, test-null, check-symbols, clean
   README.md                how to build and run, pointing here
   src/
-    main.c                 flags (train.py's names), the training loop, eval, report.json
-    model.c / model.h      struct Model: weight pointers per layer, LoRA offsets; load from safetensors; forward/backward drivers
-    layer_gdn.c            one GDN layer: fwd (save mode / recompute mode), bwd; calls gemm + kernel wrappers
+    main.c                 flags (train.py's names), the training loop, the dev check, eval, report.json,
+                           --dump-forward/--dump-backward, --trace-loss
+    model.c / model.h      the loader (every tensor through st_get into one fp32 arena), jt_batch_set,
+                           jt_ctx_alloc/free, layer_fwd/layer_bwd, model_forward, model_backward (section 6.2's sweep)
+    model_table.c / .h     the model as data: per-layer names/shapes/LoRA flags, the 150 adapted linears in
+                           flat-buffer order, config constants (section 3.2's list, as data)
+    linear.c / linear.h    the frozen `struct Linear` and linear_fwd/linear_bwd (section 4.2/5)
+    layer.h                the frozen layer API: JtCtx, the two-half arena, JT_FWD_ONLY/JT_FWD_SAVE, HeadBatch,
+                           the ten fwd/bwd signatures, the three JT_LAYER_* return codes
+    layer_gdn.c            one GDN layer: fwd (save/recompute mode), bwd; calls gemm + kernel wrappers
     layer_attn.c           one full-attention layer, same shape
     layer_mlp.c            the MLP + its norm, shared by both layer types
     head.c                 final norm, readout, CE, dlogits
     lora.c                 the flat parameter buffer, offsets, init/load/save adapter, Adam, clip, schedule
     gemm.c / gemm.h        row-major wrappers (section 5)
-    st.c / st.h            safetensors read (mmap) and write
+    st.c / st.h            safetensors read (mmap, validating) and write
     jtb.c / jtb.h          .jtb reader (section 9.1)
-    json.c                 just enough JSON writing for report.json, adapter_config.json, pred-*.jsonl
+    json.c / json.h        just enough JSON: report.json, pred-*.jsonl, the --trace-loss record, plus the field
+                           scanners for prep.py's .prep.json sidecar and decision_config.json's temperature
     util.h                 CK/CB macros, timers, arena allocator
   kernels/
     norm.cu  act.cu  rope.cu  conv.cu  gdn.cu  attn.cu  head.cu  adam.cu  misc.cu
-  ref/                     CPU fp32 references, one per kernels/*.cu file, same function names with a ref_ prefix
+  ref/                     CPU fp32 references, one per kernels/*.cu file, same function names with a ref_ prefix;
+                           built twice (float, and double under -DJT_REAL_DOUBLE for the gradchecks)
   test/
-    test_gemm.c  test_kernels.c  test_gdn.c  gradcheck.c  test_st.c  test_jtb.c  test_layer.c
+    harness.h              gates (JT_TOL_*), rnd_fill/rel_err/CHECK_*, device helpers, the FD gradcheck core
+    test_kernels.c  gradcheck.c        the two frozen dispatchers (a group returns JT_OK/JT_FAIL/JT_NOT_IMPL)
+    k_*.c                  one GPU-vs-reference group each: misc norm act rope conv attn head adam
+    grad_*.c               one CPU gradcheck group each: norm act rope conv attn head gdn lora
+    test_gdn.c  test_gemm.c  test_st.c  test_jtb.c  test_hello.c  test_layer.c  test_linear.c
   py/
     prep.py  make_fixture.py  make_adapter.py  dump_ref.py  compare_layers.py
+    trace_train_order.py   the prep.py vs train.py batch-order evidence
+    trace_train_loss.py    train.py's per-step per-row CE, for M6.2
+    compare_steps.py       trace_train_loss.py's output vs --trace-loss, with the M6.2 gate
   scripts/
-    gpubox-sync.sh  gpubox-build.sh  card-check.sh  parity-eval.sh  parity-steps.sh  arm.sh
+    gpubox-sync.sh  gpubox-build.sh  gpubox-run.sh  prereq-check.sh  card-check.sh
+    parity-eval.sh  parity-steps.sh  timing.sh  arm.sh
+  notes/                   one <task>.md per step, first line STATUS: PASS or STATUS: BLOCKED — … (plan rule 9)
 ```
 
-The model is described by one table in `model.c`, not by string building scattered through the code: for each
-layer, the safetensors names it loads and whether each linear has LoRA. Section 3.2's list, as data.
+The model is described by one table, `src/model_table.c`, not by string building scattered through the code: for each
+layer, the safetensors names it loads and whether each linear has LoRA. Section 3.2's list, as data. It is its own
+translation unit rather than a part of `model.c` because `src/lora.c` needs it before `model.c` exists; `model.c` is the
+loader that consumes it and verifies every name and dimension against the checkpoint.
 
 `struct Linear { const float *W; int in, out; int lora; size_t a_off, b_off; const char *stem; }`: `lora` set means
 `a_off`/`b_off` index the flat parameter buffer. `linear_fwd(ctx, &lin, x, N, y, u_save)` and
 `linear_bwd(ctx, &lin, x, u, dy, N, dx, accumulate_dx)` are the only functions that touch W, A or B. Every layer
-calls them.
+calls them. Two caveats found in use: `linear_fwd`/`linear_bwd` return `JT_LAYER_FAIL` (never `exit()`) on a bad call,
+and `stem` must outlive the load — it once pointed into a pool `model_load` freed, which prints `?` in messages and
+breaks any lookup keyed on it.
 
 ## 14. Risks and how each is handled
 
@@ -818,7 +976,7 @@ calls them.
 |---|---|
 | a backward formula is wrong | gradcheck per kernel (double precision CPU ref) and per layer (fp32 GPU vs finite differences) before end-to-end |
 | layout mistake (q/gate interleave, conv taps, head order) | dump_ref.py layer-by-layer parity on real weights pinpoints the first layer and tensor that diverges |
-| GDN kernel too slow on the shim | v1 is fine at about 2 ms/layer; chunked WY form is M8 |
+| GDN kernel too slow on the shim | v1's real cost is 12.9 ms/layer on gpubox and 17.3 ms on the card, memory-bound on section 8.3's `sp` scratch (not the estimate this row originally carried); the chunked WY form and a resident/rolling `sp` window are M8 |
 | shim lacks an API | section 12 plus `make check-symbols` before anything runs |
 | strided-batched TF32 rejected, or a GDN kernel misbehaves on the shim | found by the card checkpoints at Plan M1.2a and M3.2a, before the code that depends on them is written |
 | tinycublas TF32 numerics differ from cuBLAS | the gate is against the exact build; TF32 runs are compared run-to-run only |
@@ -836,3 +994,13 @@ jefftrain v1 on the same card: per step about 3 x forward FLOPs (fwd + recompute
 (about 100 TFLOPS dense) gives about 0.17 s plus the recurrence (18 layers x 2 passes x about 2 ms) and small kernels.
 Target: under 0.4 s/step on gpubox (under 25 min per epoch). On the shim, the eGPU link and tinycublas's GEMM set
 the pace; measure it in M7 and write the number down.
+
+**Measured, which supersedes every estimate above.** TF32, full train split, batch 8: **1.061 s/step** (7.5 rows/s),
+i.e. **7.42x** PyTorch's 0.143 and **0.661 s/step over** the 0.4 target; peak 11.33 GB. One epoch of 28,645 rows is
+**~63 min** of training, so a full arm is ~75 min (plan M6.4). The estimate that was clearly wrong is the recurrence
+(18 layers x 12.9 ms = 232 ms per fwd+bwd, not 18 x 2 ms = 36 ms — section 8.3's `sp` traffic), and the remaining gap
+is the many small kernels and their launch cost rather than the projections; v1 made no attempt to attribute the last
+0.6 s, which is what M8's item 5 measures first. A full arm measures 1.202 / 1.164 s/step (10-13% over the 100-step
+figure, because the dev checks leave the card cold) with peak 12.29 GB — inside gpubox's 32 GB and well over design
+6.2's 12 GB target, which is what a batch-8 run of this size costs in fp32 weights plus arena. On the shim, exact mode
+is **8.94 s/step** (7.6x gpubox) for 20 steps.
