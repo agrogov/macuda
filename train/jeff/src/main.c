@@ -366,15 +366,65 @@ static char *sidecar_of(const char *path) {
   return json_file(buf);
 }
 
-// The rows batch `idx` of an epoch must have: the batch list is prep.py's, `batch` rows per batch, the last one shorter.
-static uint32_t expected_rows(uint32_t n_rows, int batch, uint32_t idx) {
-  const uint32_t start = idx * (uint32_t)batch;
-  const uint32_t left = start >= n_rows ? 0 : n_rows - start;
-  return left < (uint32_t)batch ? left : (uint32_t)batch;
+static const char *skip_ws(const char *p) {
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+  return p;
+}
+
+// The batch list the file holds, as py/prep.py records it: `<split>.prep.json`'s `rows_per_batch`, one row count per
+// batch, every epoch's list in file order (prep.py:193). The check cannot predict that list — train.py's batches()
+// length-buckets, cuts and then shuffles the batch order (design §2.3), so the one short batch a split may have lands
+// anywhere — so it is read from the sidecar instead. Returns a malloc'd array and stores its length in *n; NULL when
+// the sidecar is absent (the synthetic fixtures) or does not record the list.
+static uint32_t *sidecar_rows_per_batch(const Split *s, uint32_t *n) {
+  *n = 0;
+  if (s->sidecar == NULL) return NULL;
+  const char *p = strstr(s->sidecar, "\"rows_per_batch\"");
+  if (p == NULL) return NULL;
+  p = skip_ws(p + sizeof "\"rows_per_batch\"" - 1);
+  if (*p != ':') return NULL;
+  p = skip_ws(p + 1);
+  if (*p != '[') return NULL;
+  size_t cap = 64, len = 0;
+  uint32_t *out = (uint32_t *)malloc(cap * sizeof *out);
+  if (out == NULL) die("out of host memory (a split's batch list)");
+  int bad = 0;
+  for (p = skip_ws(p + 1); *p != ']';) {
+    char *end = NULL;
+    errno = 0;
+    const long v = strtol(p, &end, 10);
+    if (end == p || errno != 0 || v < 0) {
+      bad = 1;
+      break;
+    }
+    if (len == cap) {
+      cap *= 2;
+      uint32_t *bigger = (uint32_t *)realloc(out, cap * sizeof *out);
+      if (bigger == NULL) die("out of host memory (a split's batch list)");
+      out = bigger;
+    }
+    out[len++] = (uint32_t)v;
+    p = skip_ws(end);
+    if (*p == ',') p = skip_ws(p + 1);
+    else if (*p != ']') {
+      bad = 1;
+      break;
+    }
+  }
+  if (bad) {
+    free(out); // not the integer list prep.py writes; fall back to the count-and-sum check below
+    return NULL;
+  }
+  *n = (uint32_t)len;
+  return out;
 }
 
 // Reject a flag combination the .jtb disagrees with (plan M5.2). --batch and --epochs decide how many batches the file
 // must have and how many rows each holds, and both are in its header's n_rows/n_batches and its batch table.
+//
+// Which rows each batch holds is prep.py's call, not this check's (design §2.3): the split's row counts are whatever its
+// sidecar's `rows_per_batch` list says, compared batch by batch. Without a sidecar the list is unknown, so every batch
+// must then hold 1..--batch rows and each epoch's batch sizes must add up to the split's rows.
 static void split_check_structure(Split *s) {
   s->n_rows = jtb_n_rows(s->j);
   s->n_batches = jtb_n_batches(s->j);
@@ -383,21 +433,49 @@ static void split_check_structure(Split *s) {
   s->per_epoch = ceil_div(s->n_rows, (uint32_t)s->batch);
   const uint32_t want_batches = s->per_epoch * (uint32_t)s->epochs;
   if (s->n_batches != want_batches)
-    die("%s: %u row(s) in %u batch(es) is not what --batch %d --epochs %d implies (%u batches with %d row(s) "
-        "each); --batch/--epochs must be the ones py/prep.py wrote the file with",
-        s->path, s->n_rows, s->n_batches, s->batch, s->epochs, want_batches, s->batch);
-  for (uint32_t k = 0; k < s->n_batches; k++) {
-    uint32_t n = 0;
-    const uint32_t *rows = jtb_batch(s->j, k, &n);
-    const uint32_t want_n = expected_rows(s->n_rows, s->batch, k % s->per_epoch);
-    if (n != want_n)
-      die("%s: batch %u holds %u row(s), but --batch %d --epochs %d expects %u; the file was written with a different "
+    die("%s: %u row(s) in %u batch(es) is not what --batch %d --epochs %d implies (%u batches); the file was written "
+        "with a different --batch/--epochs",
+        s->path, s->n_rows, s->n_batches, s->batch, s->epochs, want_batches);
+
+  uint32_t listed = 0;
+  uint32_t *per_batch = sidecar_rows_per_batch(s, &listed);
+  if (per_batch != NULL && listed != s->n_batches)
+    die("%s: its .prep.json lists %u row count(s) per batch, but the file has %u batches; the sidecar is not this "
+        "file's",
+        s->path, listed, s->n_batches);
+
+  for (uint32_t e = 0; e < (uint32_t)s->epochs; e++) {
+    uint64_t epoch_rows = 0;
+    for (uint32_t i = 0; i < s->per_epoch; i++) {
+      const uint32_t k = e * s->per_epoch + i;
+      uint32_t n = 0;
+      const uint32_t *rows = jtb_batch(s->j, k, &n);
+      if (n > (uint32_t)JT_MAX_ROWS)
+        die("%s: batch %u has %u rows, at most %d are supported", s->path, k, n, JT_MAX_ROWS);
+      if (per_batch != NULL) {
+        if (per_batch[k] < 1 || per_batch[k] > (uint32_t)s->batch)
+          die("%s: its .prep.json says batch %u holds %u row(s), but --batch %d allows 1..%d; the sidecar was written "
+              "with a different --batch",
+              s->path, k, per_batch[k], s->batch, s->batch);
+        if (n != per_batch[k])
+          die("%s: batch %u holds %u row(s), but its .prep.json says %u; the sidecar and the file's batch table "
+              "disagree",
+              s->path, k, n, per_batch[k]);
+      } else if (n < 1 || n > (uint32_t)s->batch) {
+        die("%s: batch %u holds %u row(s), but --batch %d --epochs %d allows 1..%d; the file was written with a "
+            "different --batch",
+            s->path, k, n, s->batch, s->epochs, s->batch);
+      }
+      epoch_rows += n;
+      for (uint32_t r = 0; r < n; r++)
+        if (rows[r] >= s->n_rows) die("%s: batch %u names row %u, which the file does not have", s->path, k, rows[r]);
+    }
+    if (epoch_rows != (uint64_t)s->n_rows)
+      die("%s: epoch %u's batches hold %llu row(s) in all, but the split has %u; the file was written with a different "
           "--batch",
-          s->path, k, n, s->batch, s->epochs, want_n);
-    if (n > (uint32_t)JT_MAX_ROWS) die("%s: batch %u has %u rows, at most %d are supported", s->path, k, n, JT_MAX_ROWS);
-    for (uint32_t i = 0; i < n; i++)
-      if (rows[i] >= s->n_rows) die("%s: batch %u names row %u, which the file does not have", s->path, k, rows[i]);
+          s->path, e, (unsigned long long)epoch_rows, s->n_rows);
   }
+  free(per_batch);
 }
 
 // The sidecar's own record of the flags, when py/prep.py wrote one: a mismatch is rejected the same way, and --targets/
