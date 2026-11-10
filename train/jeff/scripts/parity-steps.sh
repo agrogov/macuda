@@ -24,12 +24,30 @@
 # usage (from train/jeff, on the Mac or on gpubox):
 #     JT_REMOTE=macuda-train/wt-J33 sh scripts/parity-steps.sh
 #   env: JT_REMOTE (parallel tasks must not share one), CLM, DATA, MODEL, RUNS, ADAPTER, RUN, EXACT=0, ARCH, MAX_STEPS,
-#        BATCH, ACCUM, EPOCHS, TRAIN_ROWS, DEV_ROWS, EVAL_EVERY, SEED, LR, READOUT_LR, ADAPTER_SEED
+#        BATCH, ACCUM, EPOCHS, TRAIN_ROWS, DEV_ROWS, EVAL_EVERY, SEED, LR, READOUT_LR, ADAPTER_SEED,
+#        JT_ENV="JT_A=1 JT_B=2" (added to the C trainer's environment; every word is checked here, on the Mac, against
+#        ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$ before it reaches the ssh command and anything else is refused),
+#        JT_EXPECT='<regex>' (ERE: the run fails unless jefftrain's log has a matching line, so an environment toggle
+#        that silently did nothing cannot pass — plan rule 9). The C step's output goes to the screen as before and is
+#        also kept in the run directory's c.log, which is the file JT_EXPECT is matched against.
+# The GPU work (the C step and the Python trace, both on the card) runs under gpubox's exclusive lock,
+# `flock ~/macuda-train/.gpu.lock`, like the other gpubox scripts.
 # Nothing here asks the card for anything: this is a gpubox run (plan rule 4, M6's preamble).
 set -eu
 JT_REMOTE=${JT_REMOTE:-macuda-train/jeff}
 JEFF=$(cd "$(dirname "$0")/.." && pwd)
 CLM=${CLM:-$HOME/CLM-8B}
+JT_ENV=${JT_ENV:-} JT_EXPECT=${JT_EXPECT:-}
+
+# JT_ENV is added to the C trainer's environment, so it is checked before anything is forwarded: one word per setting,
+# and only ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$ gets through, so a word with a space, ';', '$' or a quote is refused.
+for w in $JT_ENV; do
+  printf '%s\n' "$w" | grep -Eq '^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$' || {
+    echo "parity-steps: JT_ENV: '$w' is not JT_NAME=value" >&2
+    echo "parity-steps: every word must match ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*\$ — no spaces, ';', '\$' or quotes" >&2
+    exit 2
+  }
+done
 
 # Real data and CLM-8B's venv live on gpubox, so when this checkout is not next to them the run is handed over there.
 # The tunables set here are forwarded, so a run started from the Mac gets the steps and paths it asked for.
@@ -38,13 +56,25 @@ if [ ! -f "$CLM/tools/jeff_lora/train.py" ]; then
   echo "parity-steps: no CLM-8B at $CLM; running on gpubox:~/$JT_REMOTE"
   envs="JT_REMOTE='$JT_REMOTE'"
   for name in DATA MODEL PY PYC RUNS ADAPTER RUN EXACT ARCH MAX_STEPS BATCH ACCUM EPOCHS \
-              TRAIN_ROWS DEV_ROWS EVAL_EVERY SEED LR READOUT_LR ADAPTER_SEED; do
+              TRAIN_ROWS DEV_ROWS EVAL_EVERY SEED LR READOUT_LR ADAPTER_SEED JT_ENV JT_EXPECT; do
     eval "val=\${$name-}"
     [ -n "${val-}" ] || continue
     envs="$envs $name='$(printf '%s' "$val" | sed "s/'/'\\\\''/g")'"
   done
   exec ssh gpubox "cd ~/$JT_REMOTE && $envs sh scripts/parity-steps.sh"
 fi
+
+# The GPU lock every gpubox script shares, held for the whole run: the Python trace and the C step both use the card.
+# The re-exec keeps this script's own interface, so nothing below has to care whether it took the lock itself.
+if [ "${JT_LOCKED:-0}" != 1 ]; then
+  command -v flock >/dev/null 2>&1 || {
+    echo "parity-steps: flock is missing on gpubox; it is needed for ~/macuda-train/.gpu.lock" >&2
+    exit 2
+  }
+  export JT_LOCKED=1
+  exec flock ~/macuda-train/.gpu.lock sh "$0" "$@"
+fi
+unset JT_LOCKED
 
 DATA=${DATA:-$CLM/data/ovril_detect/out}
 MODEL=${MODEL:-$HOME/models/jeff-base}
@@ -107,11 +137,24 @@ echo "=== python: $(( $(date +%s) - t0 ))s"
 if [ "$EXACT" = 1 ]; then EXACT_ENV="JT_EXACT=1 TINYCUBLAS_TC=0"; else EXACT_ENV=""; fi
 echo "=== c: jefftrain ($EXACT_ENV) -> $RUN/steps.jsonl"
 t0=$(date +%s)
-env $EXACT_ENV "$JEFF/build/nv/jefftrain" --model "$MODEL" --init-adapter "$ADAPTER" \
+log=$RUN/c.log
+crc=0
+env $EXACT_ENV $JT_ENV "$JEFF/build/nv/jefftrain" --model "$MODEL" --init-adapter "$ADAPTER" \
   --train "$RUN/prep/train.jtb" --dev "$RUN/prep/dev.jtb" --output "$RUN/c" \
   --lr "$LR" --readout-lr "$READOUT_LR" --batch "$BATCH" --accum "$ACCUM" --epochs "$EPOCHS" \
   --max-steps "$MAX_STEPS" --eval-every "$EVAL_EVERY" --targets soft --weights none \
-  --log-every 1 --trace-loss "$RUN/steps.jsonl"
+  --log-every 1 --trace-loss "$RUN/steps.jsonl" > "$log" 2>&1 || crc=$?
+cat "$log"
+if [ "$crc" -ne 0 ]; then
+  echo "parity-steps: jefftrain exited $crc (log $log)" >&2
+  echo "parity-steps: FAIL — the C step did not finish"
+  exit "$crc"
+fi
+if [ -n "$JT_EXPECT" ] && ! grep -Eq -- "$JT_EXPECT" "$log"; then
+  echo "parity-steps: JT_EXPECT '$JT_EXPECT' matched no line of $log" >&2
+  echo "parity-steps: FAIL — jefftrain did not run the way it was asked to"
+  exit 1
+fi
 echo "=== c: $(( $(date +%s) - t0 ))s"
 
 # ---- 5. design §10.3.2's gate -------------------------------------------------------------------------------------

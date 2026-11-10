@@ -38,6 +38,12 @@
 #     RUN            run directory (default data/ovril_detect/runs/jefftrain-timing-<UTC stamp>, inside CLM-8B)
 #     PY_REF         PyTorch's s/step for the comparison (default 0.143, design §15)
 #     TARGET         the D§15 target in s/step (default 0.4; reported, not a failure — see above)
+#     JT_ENV         "JT_A=1 JT_B=2" adds those settings to the remote jefftrain's environment (default: none).
+#                    Every word is checked here, on the Mac, against ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$ before it reaches
+#                    the ssh command, and anything else is refused.
+#     JT_EXPECT      '<regex>' (ERE): the run fails unless jefftrain's log has a matching line — the way the compute
+#                    mode is checked below, so an environment toggle that silently did nothing cannot pass (plan rule 9).
+# The GPU work runs under gpubox's exclusive lock, `flock ~/macuda-train/.gpu.lock`, like the other gpubox scripts.
 set -eu
 JT_REMOTE=${JT_REMOTE:-macuda-train/jeff}
 ARCH=${ARCH:-sm_120}
@@ -48,11 +54,31 @@ EXACT=${EXACT:-0}
 SEED=${SEED:-0}
 PY_REF=${PY_REF:-0.143}
 TARGET=${TARGET:-0.4}
+JT_ENV=${JT_ENV:-} JT_EXPECT=${JT_EXPECT:-}
 JEFF=$(cd "$(dirname "$0")/.." && pwd)
+
+# JT_ENV is added to the remote jefftrain's environment, so it is validated here first: one word per setting, and only
+# ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$ gets through, so a word with a space, ';', '$' or a quote is refused.
+check_env() {
+  for w in $JT_ENV; do
+    printf '%s\n' "$w" | grep -Eq '^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$' || {
+      echo "timing: JT_ENV: '$w' is not JT_NAME=value" >&2
+      echo "timing: every word must match ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*\$ — no spaces, ';', '\$' or quotes" >&2
+      exit 2
+    }
+  done
+}
+sq() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+check_env
 [ "${JT_SKIP_BUILD:-0}" = 1 ] || sh "$JEFF/scripts/gpubox-build.sh"
 
-ssh gpubox "JT_REMOTE='$JT_REMOTE' BATCHES='$BATCHES' MAX_STEPS='$MAX_STEPS' DEV_ROWS='$DEV_ROWS' EXACT='$EXACT' \
-  SEED='$SEED' PY_REF='$PY_REF' TARGET='$TARGET' RUN='${RUN:-}' sh -s" <<'REMOTE'
+ssh gpubox "if ! command -v flock >/dev/null 2>&1; then
+    echo 'timing: flock is missing on gpubox; it is needed for ~/macuda-train/.gpu.lock' >&2
+    exit 2
+  fi
+  exec flock ~/macuda-train/.gpu.lock env JT_REMOTE='$JT_REMOTE' BATCHES='$BATCHES' MAX_STEPS='$MAX_STEPS' \
+  DEV_ROWS='$DEV_ROWS' EXACT='$EXACT' SEED='$SEED' PY_REF='$PY_REF' TARGET='$TARGET' RUN='${RUN:-}' \
+  JT_ENV='$(sq "$JT_ENV")' JT_EXPECT='$(sq "$JT_EXPECT")' sh -s" <<'REMOTE'
 set -eu
 cd "$HOME/CLM-8B"                          # the real splits and the venv live here (plan M6's preamble)
 . tools/jeff_lora/cuda/env.sh               # DATA, VENV, REMOTE_MODEL (and the HF/tokenizer env)
@@ -82,14 +108,19 @@ for b in $BATCHES; do
     --out-dir "$d/prep"
   echo "=== jefftrain: $MAX_STEPS steps at batch $b -> $d/out (log $d/jefftrain.log)"
   log=$d/jefftrain.log
-  if env $EXACT_ENV "$BIN" --model "$MODEL" --train "$d/prep/train.jtb" --dev "$d/prep/dev.jtb" --output "$d/out" \
-       --batch "$b" --accum 1 --epochs 1 --max-steps "$MAX_STEPS" --targets soft --weights none \
-       --lr 2e-4 --readout-lr 5e-6 --log-every 1 > "$log" 2>&1; then
+  if env $EXACT_ENV $JT_ENV "$BIN" --model "$MODEL" --train "$d/prep/train.jtb" --dev "$d/prep/dev.jtb" \
+       --output "$d/out" --batch "$b" --accum 1 --epochs 1 --max-steps "$MAX_STEPS" --targets soft \
+       --weights none --lr 2e-4 --readout-lr 5e-6 --log-every 1 > "$log" 2>&1; then
     head -n 6 "$log" | sed 's/^/  | /'
     echo "  | ..."
     tail -n 3 "$log" | sed 's/^/  | /'
     grep -qxF "$WANT" "$log" || { echo "timing: batch $b: expected '$WANT' on stdout, got:" >&2
                                   sed 's/^/  | /' "$log" >&2; rc=1; }
+    if [ -n "$JT_EXPECT" ] && ! grep -Eq -- "$JT_EXPECT" "$log"; then
+      echo "timing: batch $b: JT_EXPECT '$JT_EXPECT' matched no line of $log" >&2
+      echo "timing: batch $b: jefftrain did not run the way it was asked to" >&2
+      rc=1
+    fi
     "$PY" - "$log" "$b" "$d/out/report.json" "$PY_REF" "$TARGET" <<'PY' || rc=1
 import json, re, sys
 

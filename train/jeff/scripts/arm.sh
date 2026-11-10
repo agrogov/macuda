@@ -66,6 +66,12 @@
 #     JT_REF_RUNS    space-separated Python arm run directories for the comparison
 #     JT_PRIMARY_RUN the one the two CE gates are quoted against (default: same --seed, else the newest)
 #     DEV_TOL, TEST_TOL   the two CE gates (defaults 0.01 and 0.02 — the design's; do not loosen them)
+#     JT_ENV         "JT_A=1 JT_B=2" adds those settings to the remote jefftrain's environment (default: none).
+#                    Every word is checked here, on the Mac, against ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$ before it reaches
+#                    the ssh command, and anything else is refused.
+#     JT_EXPECT      '<regex>' (ERE): the run fails unless jefftrain's log has a matching line — the way the compute
+#                    mode is checked below, so an environment toggle that silently did nothing cannot pass (plan rule 9).
+# The GPU work runs under gpubox's exclusive lock, `flock ~/macuda-train/.gpu.lock`, like the other gpubox scripts.
 set -eu
 ARM=${1:-}
 case $ARM in
@@ -84,13 +90,33 @@ EXACT=${EXACT:-0}
 BATCH=${BATCH:-8} ACCUM=${ACCUM:-1} EPOCHS=${EPOCHS:-1} EVAL_EVERY=${EVAL_EVERY:-500}
 SEED=${SEED:-0} LR=${LR:-2e-4} READOUT_LR=${READOUT_LR:-5e-6} ADAPTER_SEED=${ADAPTER_SEED:-1}
 DEV_TOL=${DEV_TOL:-0.01} TEST_TOL=${TEST_TOL:-0.02}
+JT_ENV=${JT_ENV:-} JT_EXPECT=${JT_EXPECT:-}
 JEFF=$(cd "$(dirname "$0")/.." && pwd)
+
+# JT_ENV is added to the remote jefftrain's environment, so it is validated here first: one word per setting, and only
+# ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$ gets through, so a word with a space, ';', '$' or a quote is refused.
+check_env() {
+  for w in $JT_ENV; do
+    printf '%s\n' "$w" | grep -Eq '^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$' || {
+      echo "arm: JT_ENV: '$w' is not JT_NAME=value" >&2
+      echo "arm: every word must match ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*\$ — no spaces, ';', '\$' or quotes" >&2
+      exit 2
+    }
+  done
+}
+sq() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+check_env
 [ "${JT_SKIP_BUILD:-0}" = 1 ] || sh "$JEFF/scripts/gpubox-build.sh"
 
-ssh gpubox "JT_REMOTE='$JT_REMOTE' ARM='$ARM' TARGETS='$TARGETS' WEIGHTS='$WEIGHTS' WEIGHT_CAP='$WEIGHT_CAP' \
-  EXACT='$EXACT' BATCH='$BATCH' ACCUM='$ACCUM' EPOCHS='$EPOCHS' EVAL_EVERY='$EVAL_EVERY' SEED='$SEED' LR='$LR' \
-  READOUT_LR='$READOUT_LR' ADAPTER_SEED='$ADAPTER_SEED' DEV_TOL='$DEV_TOL' TEST_TOL='$TEST_TOL' \
-  RUN='${RUN:-}' JT_REF_RUNS='${JT_REF_RUNS:-}' JT_PRIMARY_RUN='${JT_PRIMARY_RUN:-}' sh -s" <<'REMOTE'
+ssh gpubox "if ! command -v flock >/dev/null 2>&1; then
+    echo 'arm: flock is missing on gpubox; it is needed for ~/macuda-train/.gpu.lock' >&2
+    exit 2
+  fi
+  exec flock ~/macuda-train/.gpu.lock env JT_REMOTE='$JT_REMOTE' ARM='$ARM' TARGETS='$TARGETS' WEIGHTS='$WEIGHTS' \
+  WEIGHT_CAP='$WEIGHT_CAP' EXACT='$EXACT' BATCH='$BATCH' ACCUM='$ACCUM' EPOCHS='$EPOCHS' EVAL_EVERY='$EVAL_EVERY' \
+  SEED='$SEED' LR='$LR' READOUT_LR='$READOUT_LR' ADAPTER_SEED='$ADAPTER_SEED' DEV_TOL='$DEV_TOL' \
+  TEST_TOL='$TEST_TOL' RUN='${RUN:-}' JT_REF_RUNS='${JT_REF_RUNS:-}' JT_PRIMARY_RUN='${JT_PRIMARY_RUN:-}' \
+  JT_ENV='$(sq "$JT_ENV")' JT_EXPECT='$(sq "$JT_EXPECT")' sh -s" <<'REMOTE'
 set -eu
 cd "$HOME/CLM-8B"                          # the real splits, the venv and the other arms' runs live here
 . tools/jeff_lora/cuda/env.sh               # DATA, VENV, REMOTE_MODEL (and the HF/tokenizer env)
@@ -132,7 +158,7 @@ echo "=== adapter: py/make_adapter.py (fresh: A random, B random * 1e-2) -> $RUN
 echo "=== jefftrain: the $ARM arm -> $RUN/c"
 log=$RUN/jefftrain.log
 t0=$(date +%s)
-env $EXACT_ENV "$BIN" --model "$MODEL" --init-adapter "$RUN/adapter-init" \
+env $EXACT_ENV $JT_ENV "$BIN" --model "$MODEL" --init-adapter "$RUN/adapter-init" \
   --train "$RUN/prep/train.jtb" --dev "$RUN/prep/dev.jtb" --output "$RUN/c" \
   --batch "$BATCH" --accum "$ACCUM" --epochs "$EPOCHS" --eval-every "$EVAL_EVERY" \
   --eval "calibration=$RUN/prep/calibration.jtb" --eval "test=$RUN/prep/test.jtb" --eval-temperature 1 \
@@ -147,6 +173,11 @@ grep -qxF "$WANT" "$log" || { echo "arm: expected '$WANT' on stdout, got:" >&2
                                 head -n 5 "$log" | sed 's/^/  | /' >&2; }
 grep -E '^  dev @ step|^eval |^jefftrain:|^peak ' "$log" | head -n 40 | sed 's/^/  | /'
 echo "  | $(grep -c '^  step ' "$log") step line(s) over $(( $(date +%s) - t0 ))s (full log $log)"
+if [ -n "$JT_EXPECT" ] && ! grep -Eq -- "$JT_EXPECT" "$log"; then
+  echo "arm: JT_EXPECT '$JT_EXPECT' matched no line of $log — jefftrain did not run the way it was asked to" >&2
+  echo "arm: FAIL — JT_EXPECT did not match"
+  exit 1
+fi
 
 # ---- 4. the calibrated predictions, in the same way arms.sh does it ------------------------------------------------
 echo "=== temperature: tools/jeff_lora/cuda/fit_temperature.py on calibration"

@@ -19,15 +19,41 @@
 #   JT_REF_PREDS   the reference pred-test.jsonl (default: the newest runs/cuda-parity-fp32-*/pred-test.jsonl)
 #   JT_MAX_DP      gate: max |dp| (default 0.05 — the plan's; do not loosen it)
 #   JT_MIN_AGREE   gate: argmax agreement out of 160 (default 158 — likewise)
+#   JT_ENV         "JT_A=1 JT_B=2" adds those settings to the remote jefftrain's environment (default: none). Every
+#                  word is checked here, on the Mac, against ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$ before it reaches the ssh
+#                  command, and anything else is refused.
+#   JT_EXPECT      '<regex>' (ERE): a mode fails unless jefftrain's log has a matching line — the way the compute
+#                  mode is checked already, so an environment toggle that silently did nothing cannot pass (rule 9).
+# The GPU work runs under gpubox's exclusive lock, `flock ~/macuda-train/.gpu.lock`, like the other gpubox scripts.
 set -eu
 JT_REMOTE=${JT_REMOTE:-macuda-train/jeff}
 MAXDP=${JT_MAX_DP:-0.05}
 MINAGREE=${JT_MIN_AGREE:-158}
+JT_ENV=${JT_ENV:-} JT_EXPECT=${JT_EXPECT:-}
 JEFF=$(cd "$(dirname "$0")/.." && pwd)
+
+# JT_ENV is added to the remote jefftrain's environment, so it is validated here first: one word per setting, and only
+# ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$ gets through, so a word with a space, ';', '$' or a quote is refused.
+check_env() {
+  for w in $JT_ENV; do
+    printf '%s\n' "$w" | grep -Eq '^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*$' || {
+      echo "parity-eval: JT_ENV: '$w' is not JT_NAME=value" >&2
+      echo "parity-eval: every word must match ^JT_[A-Z0-9_]+=[A-Za-z0-9._-]*\$ — no spaces, ';', '\$' or quotes" >&2
+      exit 2
+    }
+  done
+}
+sq() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+check_env
 [ "${JT_SKIP_BUILD:-0}" = 1 ] || sh "$JEFF/scripts/gpubox-build.sh"
 
-ssh gpubox "JT_REMOTE='$JT_REMOTE' MAXDP='$MAXDP' MINAGREE='$MINAGREE' JT_PARITY_TS='${JT_PARITY_TS:-}' \
-  JT_REF_PREDS='${JT_REF_PREDS:-}' bash -s" <<'REMOTE'
+ssh gpubox "if ! command -v flock >/dev/null 2>&1; then
+    echo 'parity-eval: flock is missing on gpubox; it is needed for ~/macuda-train/.gpu.lock' >&2
+    exit 2
+  fi
+  exec flock ~/macuda-train/.gpu.lock env JT_REMOTE='$JT_REMOTE' MAXDP='$MAXDP' MINAGREE='$MINAGREE' \
+  JT_PARITY_TS='${JT_PARITY_TS:-}' JT_REF_PREDS='${JT_REF_PREDS:-}' JT_ENV='$(sq "$JT_ENV")' \
+  JT_EXPECT='$(sq "$JT_EXPECT")' bash -s" <<'REMOTE'
 set -euo pipefail
 cd "$HOME/CLM-8B"
 . tools/jeff_lora/cuda/env.sh            # DATA, VENV, REMOTE_MODEL (and the HF/tokenizer env)
@@ -59,15 +85,19 @@ $PY "$PREP" --clm "$PWD" --model "$MODEL" --eval "test=$DATA/test.jsonl" --batch
 
 rc=0
 for mode in tf32 exact; do
-  want="gemm: tf32"; exact=()
-  [ "$mode" = exact ] && { want="gemm: exact fp32"; exact=(env JT_EXACT=1); }
+  want="gemm: tf32"; exact_env=""
+  if [ "$mode" = exact ]; then want="gemm: exact fp32"; exact_env="JT_EXACT=1"; fi
   echo "parity-eval: jefftrain --eval-only, $mode build -> $OUT/$mode"
   log=$(mktemp)
-  if ${exact[@]+"${exact[@]}"} "$BIN" --model "$MODEL" --eval-only --eval "test=$OUT/test.jtb" --batch 4 \
+  if env $exact_env $JT_ENV "$BIN" --model "$MODEL" --eval-only --eval "test=$OUT/test.jtb" --batch 4 \
        --eval-temperature "$T" --output "$OUT/$mode" > "$log" 2>&1; then
     sed 's/^/  | /' "$log"
     grep -qxF "$want" "$log" || { echo "parity-eval: $mode: expected '$want' on stdout, got:" >&2
                                    sed 's/^/  | /' "$log" >&2; rc=1; }
+    if [ -n "$JT_EXPECT" ] && ! grep -Eq -- "$JT_EXPECT" "$log"; then
+      echo "parity-eval: $mode: JT_EXPECT '$JT_EXPECT' matched no line of the log" >&2
+      rc=1
+    fi
     $PY "$COMPARE" "$OUT/$mode/pred-test.jsonl" "$ref" --max-dp "$MAXDP" --min-agree "$MINAGREE" \
       || { echo "parity-eval: $mode FAILED the gate (max |dp| <= $MAXDP, argmax >= $MINAGREE)" >&2; rc=1; }
   else
