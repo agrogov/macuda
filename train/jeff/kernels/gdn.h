@@ -16,6 +16,7 @@
 #define JT_GDN_H
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <stddef.h>
 
 #define JT_GDN_DIM 128                            // Dk = Dv (design §3.6: head_dim, 128 in the model)
@@ -43,9 +44,47 @@ typedef struct {
   float *dg_part;
 } gdn_bwd_work;
 
+// ---- the chunked (WY-form) path: plan M8.2, design §8.3's last paragraph -----------------------------------------
+// The recurrence of design §3.6 is one sequential chain per (row, head); the chunked form unrolls it over chunks of
+// JT_GDN_SEG tokens so a chunk is a handful of GEMMs (see the derivation at the top of kernels/gdn.cu). It is the same
+// function in a different order, so its result differs from the sequential kernels by rounding only (measured: 1e-6
+// relative on every shape test_gdn runs, against the 1e-4 gate).
+//
+// The chunked path needs a cuBLAS handle and scratch. Both come from the caller (there is no global state, design §12):
+// `blas` is the context's single handle and `arena` is a float buffer of at least gdn_chunk_arena_floats(B, H) floats.
+// layer_gdn.c passes the context's c->cublas and its c->gdn_work.sp, which is B*H times larger than this path needs.
+// A NULL plan, an unset or 0 `JT_GDN_CHUNKED` in the environment, or an arena that is too small runs the sequential
+// kernels instead; the too-small case says so on stderr once rather than silently returning wrong numbers.
+typedef struct {
+  cublasHandle_t blas;
+  float *arena;
+  size_t arena_n;
+} gdn_chunk_plan;
+
+// What the chunked path needs in `arena` for a packed batch of B rows and H heads: 17 [CH][DIM] chunks, 11 [CH][CH]
+// matrices, 4 [DIM][DIM] states and the four per-token gate rows, i.e. 250,112 floats per (row, head).
+#define GDN_CHUNK_FLOATS_PER_SEQ                                                                          \
+  (17 * (size_t)(JT_GDN_SEG * JT_GDN_DIM) + 11 * (size_t)(JT_GDN_SEG * JT_GDN_SEG) +                        \
+   4 * (size_t)(JT_GDN_DIM * JT_GDN_DIM) + 4 * (size_t)JT_GDN_SEG)
+
+static inline size_t gdn_chunk_arena_floats(int B, int H) {
+  return (size_t)B * (size_t)H * GDN_CHUNK_FLOATS_PER_SEQ;
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// 1 when the environment says JT_GDN_CHUNKED=1 (or any value but 0), else 0: the switch between the two implementations.
+//
+// It is OFF by default because, measured on gpubox's RTX 5090, the chunked form is not faster here: the recurrence's 1e-4
+// gate (plan M3.2) keeps these GEMMs on CUBLAS_COMPUTE_32F, i.e. plain fp32 rather than tensor-core TF32, and the
+// triangular solve and the intra-chunk matrices cost 4x the sequential forward's FLOPs and 13x its backward's (padding
+// included). At B = 8 / N = 5094 one GDN call measures 4.5 ms of forward against the sequential 1.4 ms, and 9.4 ms of
+// backward against 12.5 ms -- a wash per layer, +5.2% per training step (notes/J37.md has the table). Both implementations
+// are kept: the numbers are the reason this one is opt-in, not the algorithm, and the shim's GEMM-to-kernel ratio is a
+// different measurement (a G-* card run).
+int gdn_chunked_enabled(void);
 
 // ---- forward (design §3.6, §8.3) ---------------------------------------------------------------------------------
 // o[t,h,j] for every token t of every row, from S = 0 at the row's first token. Grid (B, H, 4), one warp per block.
@@ -56,8 +95,12 @@ extern "C" {
 // so segment 0's slot is all zeros, and a row shorter than JT_GDN_SEG writes only that one. nseg must be at least
 // gdn_ckpt_segs(off, B) (below); the buffer is gdn_ckpt_floats(B, H, nseg) floats. The forward never reads it, so a
 // forward-only pass may pass NULL.
+// `plan` selects the chunked implementation and carries its handle and scratch; NULL runs the sequential kernels above.
+// nseg doubles as the chunk count: it is ceil(longest row / JT_GDN_SEG) (gdn_ckpt_segs), which is exactly how many chunk
+// steps the chunked forward makes. The chunked forward writes the same ckpt entries (the state *before* each chunk's
+// first token) as the sequential one, so the two are interchangeable.
 void gdn_fwd(const float *q, const float *k, const float *v, const float *g, const float *beta, const int *off, int B,
-             int H, int nseg, float *ckpt, float *o, cudaStream_t s);
+             int H, int nseg, float *ckpt, float *o, const gdn_chunk_plan *plan, cudaStream_t s);
 
 // ---- backward (design §4.8 the math, §8.3 phase A / phase B) ------------------------------------------------------
 // The five input gradients of the recurrence from dout = dLoss/do, replayed from the forward's checkpoints (gdn_fwd's
@@ -70,9 +113,11 @@ void gdn_fwd(const float *q, const float *k, const float *v, const float *g, con
 // `work` holds the caller's supporting buffers (design §8.3: "allocated once by the caller"), whose sizes the helpers
 // below compute. This one call launches the reverse kernel and then the 4-tile reduce, so the five gradients are final
 // when it returns.
+// `plan` is gdn_fwd's (NULL = the sequential kernels); the chunked backward uses `work->sp` as its arena only through
+// the plan, so a caller that runs chunked can pass the same buffer twice.
 void gdn_bwd(const float *q, const float *k, const float *v, const float *g, const float *beta, const float *dout,
              const int *off, int B, int H, int N, int nseg, const float *ckpt, const gdn_bwd_work *work, float *dv,
-             float *dq, float *dk, float *dg, float *dbeta, cudaStream_t s);
+             float *dq, float *dk, float *dg, float *dbeta, const gdn_chunk_plan *plan, cudaStream_t s);
 
 #ifdef __cplusplus
 }

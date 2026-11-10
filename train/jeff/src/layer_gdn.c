@@ -209,9 +209,17 @@ int layer_gdn_mixer_fwd(JtCtx *c, const LayerWeights *lw, const float *x_in, int
   // expression already has the minus sign.
   k_gdn_gates_fwd(f.bb, f.aa, lw->a_log, lw->dt_bias, f.beta, f.g, nt, GDN_HEADS, c->stream);
 
-  // The recurrence, one grid over the packed rows (state restarts at each row's first token, design §7/§8.3).
+  // The recurrence, one grid over the packed rows (state restarts at each row's first token, design §7/§8.3). The plan is
+  // plan M8.2's chunked (WY-form) path: BLAS handle plus the backward's `sp` buffer as its arena, which gdn.h's
+  // gdn_chunk_arena_floats() shows is four times bigger than the chunked path needs (it is the smallest scratch the
+  // layer already owns). JT_GDN_CHUNKED=1 in the environment selects it (the default is the sequential kernels: gdn.h has
+  // the measured reason); the two agree to rounding (1e-6 relative).
+  gdn_chunk_plan plan;
+  plan.blas = c->cublas;
+  plan.arena = c->gdn_work.sp;
+  plan.arena_n = gdn_bwd_sp_floats((size_t)b->rows, GDN_HEADS);
   gdn_fwd(f.qkn, f.qkn + n2, v, f.g, f.beta, b->off_dev, b->rows, GDN_HEADS, c->gdn_nseg,
-          save ? c->gdn_ckpt : NULL, f.o, c->stream);
+          save ? c->gdn_ckpt : NULL, f.o, &plan, c->stream);
 
   // y = GatedRMSNorm(o; gdn_norm.weight, gate = z): y = w (x r) silu(z), per head, d = 128 (design §3.3/§4.4).
   gated_rmsnorm_fwd(f.o, lw->gdn_norm, f.z, f.y, f.ro, nt, MT_GDN_HEAD_DIM, 0, c->stream);
@@ -302,9 +310,14 @@ int layer_gdn_mixer_bwd(JtCtx *c, const LayerWeights *lw, const float *x_in, flo
   // The recurrence (design §4.8's reverse loop, kernels/gdn.h): replayed from the forward's checkpoints, so it needs the
   // JT_FWD_SAVE pass, not a JT_FWD_ONLY one. dv has no tile reduction; dq, dk and the two gate gradients do, inside the
   // call. dq|dk go to the pre-l2norm (post-silu) gradient through l2norm_bwd below; dv is already one.
-  if (rc == JT_LAYER_OK)
+  if (rc == JT_LAYER_OK) {
+    gdn_chunk_plan plan; // the forward's (gdn.h: the handle and the arena the chunked path needs)
+    plan.blas = c->cublas;
+    plan.arena = c->gdn_work.sp;
+    plan.arena_n = gdn_bwd_sp_floats((size_t)b->rows, GDN_HEADS);
     gdn_bwd(f.qkn, f.qkn + n2, f.ck + 2 * n2, f.g, f.beta, g.dout, b->off_dev, b->rows, GDN_HEADS, n, c->gdn_nseg,
-            c->gdn_ckpt, &c->gdn_work, g.dch + 2 * n2, g.dqh, g.dqh + n2, g.dg, g.dbeta, c->stream);
+            c->gdn_ckpt, &c->gdn_work, g.dch + 2 * n2, g.dqh, g.dqh + n2, g.dg, g.dbeta, &plan, c->stream);
+  }
 
   // q = l2norm(qc) / sqrt(128) and k = l2norm(kc): the two per-head norms' backward (design §4.8's second block). The
   // post_scale is the same one the forward passed (kernels/norm.h); dv needs no norm, so it is not touched.

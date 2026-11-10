@@ -149,6 +149,8 @@ static void case_fwd(const int *lens, int B, const char *tag, int replay_h) {
   float *q = (float *)xalloc(nq * sizeof *q), *k = (float *)xalloc(nq * sizeof *k);
   float *v = (float *)xalloc(nq * sizeof *v), *o_ref = (float *)xalloc(nq * sizeof *o_ref);
   float *o_got = (float *)xalloc(nq * sizeof *o_got), *o_null = (float *)xalloc(nq * sizeof *o_null);
+  float *o_seq = (float *)xalloc(nq * sizeof *o_seq); // the sequential kernels' o
+  float *o_ck = (float *)xalloc(nq * sizeof *o_ck);   // and the chunked path's, for the cross-implementation check
   float *g = (float *)xalloc(ng * sizeof *g), *beta = (float *)xalloc(ng * sizeof *beta);
 
   // Inputs in the ranges the model produces: q and k are l2-normed (q additionally scaled by 1/sqrt(128), design §3.6),
@@ -169,13 +171,23 @@ static void case_fwd(const int *lens, int B, const char *tag, int replay_h) {
   float *o_d = dev_alloc(nq * sizeof *o_got);
   float *ck_d = dev_alloc(nck * sizeof *ck_d);
 
+  // The chunked path (plan M8.2) needs a cuBLAS handle and an arena; the arena is the size layer_gdn.c passes -- the
+  // backward's sp buffer -- so the test exercises the trainer's sizing (gdn.h: gdn_chunk_arena_floats).
+  gdn_chunk_plan plan;
+  const size_t narena = gdn_bwd_sp_floats((size_t)B, H);
+  CB(cublasCreate(&plan.blas));
+  plan.arena = (float *)dev_alloc(narena * sizeof *plan.arena);
+  plan.arena_n = narena;
+  printf("    (main run: %s kernels; the cross-check covers both)\n",
+         gdn_chunked_enabled() ? "chunked" : "sequential");
+
   // 0x7f7f7f7f is a huge finite float: if the forward ever read the checkpoints the numbers would show it, and if it
   // failed to write segment 0 the zero check below would see this pattern.
   CK(cudaMemset(ck_d, 0x7f, nck * sizeof *ck_d));
-  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, NULL, o_d, 0); // warm-up: the first launch pays the context's cost
+  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, NULL, o_d, &plan, 0); // warm-up: the first launch pays the context's cost
   CK(cudaDeviceSynchronize());
   double t0 = jt_now();
-  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, ck_d, o_d, 0);
+  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, ck_d, o_d, &plan, 0);
   CK(cudaDeviceSynchronize());
   const double ms = 1e3 * (jt_now() - t0);
   JT_SYNC_DEBUG;
@@ -185,9 +197,10 @@ static void case_fwd(const int *lens, int B, const char *tag, int replay_h) {
   CHECK_REL(name, o_got, o_ref, nq, TOL);
 
   // The same forward with no checkpoint buffer: same numbers, bit for bit (the stores are not part of the arithmetic),
-  // and the time the checkpoint stores cost (design §8.3 trades that memory for the backward's replay).
+  // and the time the checkpoint stores cost (design §8.3 trades that memory for the backward's replay). nseg is passed
+  // even without a buffer so the *same* implementation runs both times (the chunked path needs the chunk count).
   t0 = jt_now();
-  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, 0, NULL, o_d, 0);
+  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, NULL, o_d, &plan, 0);
   CK(cudaDeviceSynchronize());
   const double ms_nockpt = 1e3 * (jt_now() - t0);
   JT_SYNC_DEBUG;
@@ -199,6 +212,24 @@ static void case_fwd(const int *lens, int B, const char *tag, int replay_h) {
 
   if (jt_has_card()) check_ckpt(ck_d, o_got, q, k, v, g, beta, off, lens, B, nseg, tag, replay_h);
 
+  // The two implementations of the same function, in one build and whatever the ambient setting: JT_GDN_CHUNKED=1 runs
+  // the chunked (plan M8.2) path, =0 the sequential kernels, and the two must agree to rounding (same function, different
+  // summation order). The ambient value is restored afterwards, so the rest of the run follows what it asked for.
+  const char *amb = getenv("JT_GDN_CHUNKED");
+  setenv("JT_GDN_CHUNKED", "1", 1);
+  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, NULL, o_d, &plan, 0);
+  CK(cudaDeviceSynchronize());
+  dev_download(o_d, o_ck, nq);
+  setenv("JT_GDN_CHUNKED", "0", 1);
+  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, NULL, o_d, &plan, 0);
+  CK(cudaDeviceSynchronize());
+  dev_download(o_d, o_seq, nq);
+  if (amb != NULL) setenv("JT_GDN_CHUNKED", amb, 1); else unsetenv("JT_GDN_CHUNKED");
+  snprintf(name, sizeof name, "gdn_fwd chunked_vs_sequential %s", tag);
+  CHECK_REL(name, o_ck, o_seq, nq, TOL);
+
+  dev_free(plan.arena);
+  CB(cublasDestroy(plan.blas));
   dev_free(ck_d);
   dev_free(o_d);
   dev_free(b_d);
@@ -209,6 +240,8 @@ static void case_fwd(const int *lens, int B, const char *tag, int replay_h) {
   dev_free(off_d);
   free(beta);
   free(g);
+  free(o_ck);
+  free(o_seq);
   free(o_null);
   free(o_got);
   free(o_ref);
@@ -363,6 +396,11 @@ static void case_bwd(const int *lens, int B, const char *tag, int sp_h, int norm
   float *q_d = dev_upload(q, nq), *k_d = dev_upload(k, nq), *v_d = dev_upload(v, nq);
   float *do_d = dev_upload(dout, nq), *g_d = dev_upload(g, ng), *b_d = dev_upload(beta, ng);
   float *o_d = dev_alloc(nq * sizeof *o_d), *ck_d = dev_alloc(nck * sizeof *ck_d);
+  gdn_chunk_plan plan;
+  const size_t narena = gdn_bwd_sp_floats((size_t)B, H); // the arena layer_gdn.c passes: the sp buffer itself
+  CB(cublasCreate(&plan.blas));
+  plan.arena = (float *)dev_alloc(narena * sizeof *plan.arena);
+  plan.arena_n = narena;
   gdn_bwd_work wk;
   wk.sp = (float *)dev_alloc(nsp * sizeof *wk.sp);
   wk.dq_part = (float *)dev_alloc(npart * sizeof *wk.dq_part);
@@ -383,21 +421,21 @@ static void case_bwd(const int *lens, int B, const char *tag, int sp_h, int norm
 
   // Warm-up: the first launch that writes a freshly allocated buffer is many times slower than the next one on gpubox
   // (WSL2's driver maps the pages lazily), so the timed calls follow one full pass over the same buffers.
-  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, ck_d, o_d, 0);
-  gdn_bwd(q_d, k_d, v_d, g_d, b_d, do_d, off_d, B, H, N, nseg, ck_d, &wk, dv_d, dq_d, dk_d, dg_d, db_d, 0);
+  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, ck_d, o_d, &plan, 0);
+  gdn_bwd(q_d, k_d, v_d, g_d, b_d, do_d, off_d, B, H, N, nseg, ck_d, &wk, dv_d, dq_d, dk_d, dg_d, db_d, &plan, 0);
   CK(cudaDeviceSynchronize());
   double t0 = jt_now();
-  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, ck_d, o_d, 0);
+  gdn_fwd(q_d, k_d, v_d, g_d, b_d, off_d, B, H, nseg, ck_d, o_d, &plan, 0);
   CK(cudaDeviceSynchronize());
   const double ms_fwd = 1e3 * (jt_now() - t0);
   t0 = jt_now();
-  gdn_bwd(q_d, k_d, v_d, g_d, b_d, do_d, off_d, B, H, N, nseg, ck_d, &wk, dv_d, dq_d, dk_d, dg_d, db_d, 0);
+  gdn_bwd(q_d, k_d, v_d, g_d, b_d, do_d, off_d, B, H, N, nseg, ck_d, &wk, dv_d, dq_d, dk_d, dg_d, db_d, &plan, 0);
   CK(cudaDeviceSynchronize());
   const double ms_bwd = 1e3 * (jt_now() - t0);
   double ms_bwd_best = ms_bwd;
   for (int rep = 0; rep < 3; rep++) {
     t0 = jt_now();
-    gdn_bwd(q_d, k_d, v_d, g_d, b_d, do_d, off_d, B, H, N, nseg, ck_d, &wk, dv_d, dq_d, dk_d, dg_d, db_d, 0);
+    gdn_bwd(q_d, k_d, v_d, g_d, b_d, do_d, off_d, B, H, N, nseg, ck_d, &wk, dv_d, dq_d, dk_d, dg_d, db_d, &plan, 0);
     CK(cudaDeviceSynchronize());
     const double ms = 1e3 * (jt_now() - t0);
     if (ms < ms_bwd_best) ms_bwd_best = ms;
@@ -422,7 +460,10 @@ static void case_bwd(const int *lens, int B, const char *tag, int sp_h, int norm
   CHECK_REL(name, dg, dg_r, ng, TOL);
   snprintf(name, sizeof name, "gdn_bwd dbeta %s", tag);
   CHECK_REL(name, db, db_r, ng, TOL);
-  if (jt_has_card() && sp_h >= 0) check_sp(wk.sp, ck_d, k, v, g, beta, off, B, nseg, sp_h, 1, tag);
+  // sp is the chunked path's arena (plan M8.2 reuses the backward's scratch), so phase A's layout check belongs to the
+  // sequential kernels only.
+  if (jt_has_card() && sp_h >= 0 && !gdn_chunked_enabled())
+    check_sp(wk.sp, ck_d, k, v, g, beta, off, B, nseg, sp_h, 1, tag);
 
   dev_free(db_d);
   dev_free(dg_d);
@@ -433,6 +474,8 @@ static void case_bwd(const int *lens, int B, const char *tag, int sp_h, int norm
   dev_free(wk.dbeta_part);
   dev_free(wk.dk_part);
   dev_free(wk.dq_part);
+  dev_free(plan.arena);
+  CB(cublasDestroy(plan.blas));
   dev_free(wk.sp);
   dev_free(ck_d);
   dev_free(o_d);
