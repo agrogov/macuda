@@ -1,0 +1,346 @@
+diff --git a/train/jeff/src/layer_attn.c b/train/jeff/src/layer_attn.c
+index e8f1f7a..47c66a2 100644
+--- a/train/jeff/src/layer_attn.c
++++ b/train/jeff/src/layer_attn.c
+@@ -83,6 +83,74 @@
+ // number. Exactly 1/16 in fp32, so it is written as one.
+ #define ATTN_SCALE 0.0625f
+ 
++
++// ---- TEMPORARY PROFILER (JT_PROF=1; reverted before this change lands) ------------------------------------------------
++#include <stdlib.h>
++static int jtp_on(void) {
++  static int v = -1;
++  if (v < 0) v = getenv("JT_PROF") != NULL;
++  return v;
++}
++enum { JTP_F_PROJ, JTP_F_SPLIT, JTP_F_ROWS, JTP_F_GATE, JTP_F_RES, JTP_B_GATE, JTP_B_ROWS, JTP_B_NORMS, JTP_B_PROJ,
++       JTP_B_RES, JTP_F_PREP, JTP_F_QK, JTP_F_SM, JTP_F_PV, JTP_F_FROMHM, JTP_B_PREP, JTP_B_PREC, JTP_B_DP, JTP_B_DV,
++       JTP_B_SM, JTP_B_DQK, JTP_B_FROMHM, JTP_N };
++static const char *jtp_name[JTP_N] = {
++    "attn.fwd_norm+proj", "attn.fwd_split+norm+rope", "attn.fwd_rows (all)", "attn.fwd_gate+o_proj",
++    "attn.fwd_residual", "attn.bwd_gate+o_proj", "attn.bwd_rows (all)", "attn.bwd_rope+norms+merge",
++    "attn.bwd_projs", "attn.bwd_resnorm", "  fwd row: to_head_major+kv_expand", "  fwd row: QK^T gemm",
++    "  fwd row: softmax", "  fwd row: PV gemm", "  fwd row: from_head_major", "  bwd row: preps",
++    "  bwd row: P recompute (QK+softmax)", "  bwd row: dP=dO V^T gemm", "  bwd row: dV=P^T dO gemm",
++    "  bwd row: softmax_bwd", "  bwd row: dQ,dK gemms", "  bwd row: fromhm+kv_reduce x3"};
++static cudaEvent_t jtp_ev[JTP_N];
++static cudaEvent_t jtp_pt[16]; // scratch pairs for the per-row pieces (events 2k, 2k+1)
++static double jtp_ms[JTP_N];
++static long jtp_n[JTP_N];
++static int jtp_ready;
++static void jtp_dump(void) {
++  double tot = 0.0;
++  fprintf(stderr, "jtp: GPU ms per phase (cuda events, one sync per phase):\n");
++  for (int i = 0; i < JTP_N; i++) {
++    if (i != JTP_F_ROWS && i != JTP_B_ROWS) tot += jtp_ms[i];
++    fprintf(stderr, "jtp:   %-36s %9.3f ms  %6ld calls  %8.4f ms/call%s\n", jtp_name[i], jtp_ms[i], jtp_n[i],
++            jtp_n[i] ? jtp_ms[i] / (double)jtp_n[i] : 0.0,
++            (i == JTP_F_ROWS || i == JTP_B_ROWS) ? "  (contains the row pieces below)" : "");
++  }
++  fprintf(stderr, "jtp:   %-36s %9.3f ms  (rows excluded, they are sums of the row pieces)\n", "SUM", tot);
++}
++static void jtp_setup(void) {
++  if (jtp_ready) return;
++  for (int i = 0; i < JTP_N; i++) cudaEventCreate(&jtp_ev[i]);
++  for (int i = 0; i < 16; i++) cudaEventCreate(&jtp_pt[i]);
++  jtp_ready = 1;
++  atexit(jtp_dump);
++}
++static void jtp_mark(int i, cudaStream_t s) {
++  jtp_setup();
++  cudaEventRecord(jtp_ev[i], s);
++}
++static void jtp_point(int i, cudaStream_t s) {
++  jtp_setup();
++  cudaEventRecord(jtp_pt[i], s);
++}
++static void jtp_acc(int slot, int from, int to) {
++  float ms = 0.0f;
++  cudaEventSynchronize(jtp_ev[to]);
++  if (cudaEventElapsedTime(&ms, jtp_ev[from], jtp_ev[to]) != cudaSuccess) ms = 0.0f;
++  jtp_ms[slot] += (double)ms;
++  jtp_n[slot]++;
++}
++static void jtp_acc_pt(int slot, int from, int to) {
++  float ms = 0.0f;
++  cudaEventSynchronize(jtp_pt[to]);
++  if (cudaEventElapsedTime(&ms, jtp_pt[from], jtp_pt[to]) != cudaSuccess) ms = 0.0f;
++  jtp_ms[slot] += (double)ms;
++  jtp_n[slot]++;
++}
++#define JTP_MARK(i, st) do { if (jtp_on()) jtp_mark((i), (st)); } while (0)
++#define JTP_PT(i, st) do { if (jtp_on()) jtp_point((i), (st)); } while (0)
++#define JTP_ACC(slot, a, b) do { if (jtp_on()) jtp_acc((slot), (a), (b)); } while (0)
++#define JTP_ACC_PT(slot, a, b) do { if (jtp_on()) jtp_acc_pt((slot), (a), (b)); } while (0)
++
+ static int attn_fail(const char *msg) {
+   fprintf(stderr, "layer_attn: %s\n", msg);
+   return JT_LAYER_FAIL;
+@@ -165,18 +233,35 @@ static void attn_row(JtCtx *c, const AttnSave *s, AttnRow *r, int off, int L) {
+   const long sq = (long)L * (long)L;
+   cudaStream_t st = c->stream;
+ 
++  JTP_PT(0, st);
++  const int notr = getenv("JT_NOTR") != NULL; // TEMPORARY probe
++  if (!notr) {
+   jt_to_head_major(s->q + (size_t)off * MT_O_IN, r->qh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+   jt_kv_expand(s->k + (size_t)off * MT_KV_OUT, r->kv_tok, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+   jt_to_head_major(r->kv_tok, r->kh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+   jt_kv_expand(s->v + (size_t)off * MT_KV_OUT, r->kv_tok, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+   jt_to_head_major(r->kv_tok, r->vh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  }
++  JTP_PT(1, st);
++  JTP_ACC_PT(JTP_F_PREP, 0, 1);
+ 
+   // Sc[h] = Q[h] K[h]^T  [L,L]: A is stored [M,K] = [L,256], B is stored [N,K] = [L,256] (hence tb = 1).
+   gemm_batched(c->cublas, 0, 1, L, L, MT_HEAD_DIM, 1.0f, r->qh, hm, r->kh, hm, 0.0f, r->sc, sq, MT_FULL_HEADS);
++  JTP_PT(2, st);
++  JTP_ACC_PT(JTP_F_QK, 1, 2);
++  if (getenv("JT_NOSMZ") != NULL) // TEMPORARY probe: no softmax, but P zeroed (no stale/denormal data)
++    cudaMemsetAsync(r->p, 0, (size_t)MT_FULL_HEADS * (size_t)L * (size_t)L * sizeof(float), st);
++  else if (getenv("JT_NOSM") == NULL) // TEMPORARY probe
+   attn_softmax_fwd(r->sc, r->p, L, MT_FULL_HEADS, ATTN_SCALE, st); // P[h] = causal_softmax(Sc[h] / 16)
++  JTP_PT(3, st);
++  JTP_ACC_PT(JTP_F_SM, 2, 3);
+   // O[h] = P[h] V[h]  [L,256]: A is stored [M,K] = [L,L], B is stored [K,N] = [L,256] (tb = 0).
+   gemm_batched(c->cublas, 0, 0, L, MT_HEAD_DIM, L, 1.0f, r->p, sq, r->vh, hm, 0.0f, r->oh, hm, MT_FULL_HEADS);
+-  jt_from_head_major(r->oh, s->o_pre + (size_t)off * MT_O_IN, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  JTP_PT(4, st);
++  JTP_ACC_PT(JTP_F_PV, 3, 4);
++  if (!notr) jt_from_head_major(r->oh, s->o_pre + (size_t)off * MT_O_IN, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  JTP_PT(5, st);
++  JTP_ACC_PT(JTP_F_FROMHM, 4, 5);
+ }
+ 
+ // One row's attention backward buffers (design §8.2's second block): the forward's q/k/v head-major scratch again (the
+@@ -218,31 +303,53 @@ static void attn_row_bwd(JtCtx *c, const AttnSave *s, AttnBwdRow *r, const float
+   const long sq = (long)L * (long)L;
+   cudaStream_t st = c->stream;
+ 
++  const int notr = getenv("JT_NOTR") != NULL; // TEMPORARY probe
++  if (!notr) {
+   jt_to_head_major(s->q + (size_t)off * MT_O_IN, r->qh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+   jt_kv_expand(s->k + (size_t)off * MT_KV_OUT, r->kv_tok, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+   jt_to_head_major(r->kv_tok, r->kh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+   jt_kv_expand(s->v + (size_t)off * MT_KV_OUT, r->kv_tok, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+   jt_to_head_major(r->kv_tok, r->vh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+   jt_to_head_major(d_o + (size_t)off * MT_O_IN, r->doh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  }
++  JTP_PT(6, st);
++  JTP_ACC_PT(JTP_B_PREP, 0, 6);
+ 
+   // P = causal_softmax(Q K^T / 16), the forward's two calls (design §8.2's first two lines).
+   gemm_batched(c->cublas, 0, 1, L, L, MT_HEAD_DIM, 1.0f, r->qh, hm, r->kh, hm, 0.0f, r->sc, sq, MT_FULL_HEADS);
+   attn_softmax_fwd(r->sc, r->p, L, MT_FULL_HEADS, ATTN_SCALE, st);
++  JTP_PT(7, st);
++  JTP_ACC_PT(JTP_B_PREC, 6, 7);
+   // dP = dO V^T (the same (ta=0, tb=1) shape as Sc, so it takes Sc's words over now that P exists).
+   gemm_batched(c->cublas, 0, 1, L, L, MT_HEAD_DIM, 1.0f, r->doh, hm, r->vh, hm, 0.0f, r->sc, sq, MT_FULL_HEADS);
++  JTP_PT(8, st);
++  JTP_ACC_PT(JTP_B_DP, 7, 8);
+   // dV = P^T dO, the forward's PV GEMM with its operands swapped (ta = 1).
+   gemm_batched(c->cublas, 1, 0, L, MT_HEAD_DIM, L, 1.0f, r->p, sq, r->doh, hm, 0.0f, r->dvh, hm, MT_FULL_HEADS);
+   // dS = (1/16) P (dP - sum_s' P dP), exactly 0 above the diagonal (design §4.7, kernels/attn.h).
++  JTP_PT(9, st);
++  JTP_ACC_PT(JTP_B_DV, 8, 9);
++  if (getenv("JT_NOSMZ") != NULL) // TEMPORARY probe
++    cudaMemsetAsync(r->dsc, 0, (size_t)MT_FULL_HEADS * (size_t)L * (size_t)L * sizeof(float), st);
++  else if (getenv("JT_NOSM") == NULL) // TEMPORARY probe
+   attn_softmax_bwd(r->p, r->sc, r->dsc, L, MT_FULL_HEADS, ATTN_SCALE, st);
++  JTP_PT(10, st);
++  JTP_ACC_PT(JTP_B_SM, 9, 10);
+   // dQ = dS K [L,256] and dK = dS^T Q [L,256].
+   gemm_batched(c->cublas, 0, 0, L, MT_HEAD_DIM, L, 1.0f, r->dsc, sq, r->kh, hm, 0.0f, r->dqh, hm, MT_FULL_HEADS);
+   gemm_batched(c->cublas, 1, 0, L, MT_HEAD_DIM, L, 1.0f, r->dsc, sq, r->qh, hm, 0.0f, r->dkh, hm, MT_FULL_HEADS);
++  JTP_PT(11, st);
++  JTP_ACC_PT(JTP_B_DQK, 10, 11);
+ 
++  if (!notr) {
+   jt_from_head_major(r->dqh, dq + (size_t)off * MT_O_IN, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+   jt_from_head_major(r->dvh, r->kv_tok, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+   jt_kv_reduce(r->kv_tok, dv + (size_t)off * MT_KV_OUT, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+   jt_from_head_major(r->dkh, r->kv_tok, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+   jt_kv_reduce(r->kv_tok, dk + (size_t)off * MT_KV_OUT, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
++  }
++  JTP_PT(12, st);
++  JTP_ACC_PT(JTP_B_FROMHM, 11, 12);
+ }
+ 
+ int layer_attn_mixer_fwd(JtCtx *c, const LayerWeights *lw, const float *x_in, int n, const JtBatch *b, float *x_out,
+@@ -285,11 +392,14 @@ int layer_attn_mixer_fwd(JtCtx *c, const LayerWeights *lw, const float *x_in, in
+   attn_row_alloc(c, &row);
+ 
+   // a = RMSNorm(x_in; input_layernorm); then the four projections off it.
++  JTP_MARK(JTP_F_PROJ, c->stream);
+   rmsnorm_fwd(x_in, lw->input_norm, s.a, s.r_in, n, MT_HIDDEN, 1, c->stream);
+   int rc = linear_fwd(c, &lw->q_proj, s.a, n, s.qg, s.u_qg);
+   if (rc == JT_LAYER_OK) rc = linear_fwd(c, &lw->k_proj, s.a, n, s.k_raw, s.u_k);
+   if (rc == JT_LAYER_OK) rc = linear_fwd(c, &lw->v_proj, s.a, n, s.v, s.u_v);
+   if (rc != JT_LAYER_OK) goto done; // linear_fwd printed why
++  JTP_MARK(JTP_F_SPLIT, c->stream);
++  JTP_ACC(JTP_F_PROJ, JTP_F_PROJ, JTP_F_SPLIT);
+ 
+   // q, gate = qgate_split(qg)  (per head interleaved, design §3.5)
+   jt_qgate_split(s.qg, s.q_pre, gate, n, MT_FULL_HEADS, MT_HEAD_DIM, c->stream);
+@@ -302,20 +412,29 @@ int layer_attn_mixer_fwd(JtCtx *c, const LayerWeights *lw, const float *x_in, in
+   rmsnorm_fwd(s.k_raw, lw->k_norm, s.k, s.r_k, n * MT_KV_HEADS, MT_HEAD_DIM, 1, c->stream);
+   rope_fwd(s.k, b->off_dev, b->row_of, n, MT_KV_HEADS, MT_HEAD_DIM, c->rope_cos, c->rope_sin, c->stream);
+ 
+-  for (int r = 0; r < b->rows; r++) {
++  JTP_MARK(JTP_F_ROWS, c->stream);
++  JTP_ACC(JTP_F_SPLIT, JTP_F_SPLIT, JTP_F_ROWS);
++  const int noattn = getenv("JT_NOATTN") != NULL;
++  for (int r = 0; r < b->rows && !noattn; r++) {
+     const int off = b->off[r], L = b->off[r + 1] - off;
+     if (L > 0) attn_row(c, &s, &row, off, L);
+   }
++  JTP_MARK(JTP_F_GATE, c->stream);
++  JTP_ACC(JTP_F_ROWS, JTP_F_ROWS, JTP_F_GATE);
+ 
+   // o = o * sigmoid(gate) over the whole packed batch (the gate is laid out like o, [n][8*256]).
+   k_sigmoid_gate_fwd(s.o_pre, gate, o_gated, n * MT_O_IN, c->stream);
+   rc = linear_fwd(c, &lw->o_proj, o_gated, n, out, s.u_o);
+   if (rc != JT_LAYER_OK) goto done;
++  JTP_MARK(JTP_F_RES, c->stream);
++  JTP_ACC(JTP_F_GATE, JTP_F_GATE, JTP_F_RES);
+ 
+   // x_out = x_in + out (design §4.6); x_out may alias x_in (src/layer.h's contract), so the copy is skipped then.
+   if (x_out != x_in)
+     CK(cudaMemcpyAsync(x_out, x_in, (size_t)n * MT_HIDDEN * sizeof(float), cudaMemcpyDeviceToDevice, c->stream));
+   jt_add_inplace(x_out, out, (size_t)n * MT_HIDDEN, c->stream);
++  JTP_MARK(JTP_B_GATE, c->stream);
++  JTP_ACC(JTP_F_RES, JTP_F_RES, JTP_B_GATE);
+ 
+ done:
+   jt_work_restore(c, mark);
+@@ -374,6 +493,7 @@ int layer_attn_mixer_bwd(JtCtx *c, const LayerWeights *lw, const float *x_in, fl
+ 
+   // gate = qgate_split(qg)'s second half; q_pre is already saved, so the split's q half goes over dqg (which is only
+   // filled by the merge at the end): one pass over [n,4096] instead of another 2048 floats per token in the saves.
++  JTP_MARK(JTP_B_GATE, c->stream);
+   jt_qgate_split(s.qg, dqg, gate, n, MT_FULL_HEADS, MT_HEAD_DIM, c->stream);
+   // o = o_pre * sigmoid(gate) again: it is both o_proj's x and the `o` of the gate's backward (design §4.7).
+   k_sigmoid_gate_fwd(s.o_pre, gate, o_gated, n * MT_O_IN, c->stream);
+@@ -384,12 +504,17 @@ int layer_attn_mixer_bwd(JtCtx *c, const LayerWeights *lw, const float *x_in, fl
+   if (rc != JT_LAYER_OK) goto done; // linear_bwd printed why
+   // 2. the output gate: do = dog sig(gate), dgate = dog o sig(gate) (1 - sig(gate)).
+   k_sigmoid_gate_bwd(d_o_gated, s.o_pre, gate, d_o, dgate, n * MT_O_IN, c->stream);
++  JTP_MARK(JTP_B_ROWS, c->stream);
++  JTP_ACC(JTP_B_GATE, JTP_B_GATE, JTP_B_ROWS);
+ 
+   // 3. per row: design §8.2's second block, into the token-major dq/dk/dv.
+-  for (int r = 0; r < b->rows; r++) {
++  const int noattn_b = getenv("JT_NOATTN") != NULL;
++  for (int r = 0; r < b->rows && !noattn_b; r++) {
+     const int off = b->off[r], L = b->off[r + 1] - off;
+     if (L > 0) attn_row_bwd(c, &s, &row, d_o, off, L, dq, dk, dv);
+   }
++  JTP_MARK(JTP_B_NORMS, c->stream);
++  JTP_ACC(JTP_B_ROWS, JTP_B_ROWS, JTP_B_NORMS);
+ 
+   // 4. RoPE backward (design §4.7: the rotation transposed) and the two norms (design §4.3, d = 256, zero-centred). Both
+   //    are per (token, head) with row-local positions, so one launch covers the packed batch.
+@@ -400,15 +525,21 @@ int layer_attn_mixer_bwd(JtCtx *c, const LayerWeights *lw, const float *x_in, fl
+ 
+   // 5. the q/gate merge back into q_proj's [n,4096] layout, then the three projections off `a`. Every dx goes to the same
+   //    buffer (`a` is the input of all three), so the first writes it and the other two add (design §4.6).
++  JTP_MARK(JTP_B_PROJ, c->stream);
++  JTP_ACC(JTP_B_NORMS, JTP_B_NORMS, JTP_B_PROJ);
+   jt_qgate_merge(dq_pre, dgate, dqg, n, MT_FULL_HEADS, MT_HEAD_DIM, c->stream);
+   rc = linear_bwd(c, &lw->q_proj, s.a, s.u_qg, dqg, n, da, 0);
+   if (rc == JT_LAYER_OK) rc = linear_bwd(c, &lw->k_proj, s.a, s.u_k, dk_raw, n, da, 1);
+   if (rc == JT_LAYER_OK) rc = linear_bwd(c, &lw->v_proj, s.a, s.u_v, dv, n, da, 1);
+   if (rc != JT_LAYER_OK) goto done;
++  JTP_MARK(JTP_B_RES, c->stream);
++  JTP_ACC(JTP_B_PROJ, JTP_B_PROJ, JTP_B_RES);
+ 
+   // 6. the input norm's backward and the residual (design §4.6): dres already holds dL/d(x_out), so this adds to it.
+   rmsnorm_bwd(x_in, lw->input_norm, da, s.r_in, dxin, n, MT_HIDDEN, 1, c->stream);
+   jt_add_inplace(dres, dxin, n_h, c->stream);
++  JTP_MARK(JTP_N - 1, c->stream);
++  JTP_ACC(JTP_B_RES, JTP_B_RES, JTP_N - 1);
+ 
+ done:
+   JT_SYNC_DEBUG; // a no-op unless -DJT_DEBUG=1, where it names a launch error at this line
+diff --git a/train/jeff/src/layer_mlp.c b/train/jeff/src/layer_mlp.c
+index d3d1c4b..f0c53a5 100644
+--- a/train/jeff/src/layer_mlp.c
++++ b/train/jeff/src/layer_mlp.c
+@@ -66,6 +66,47 @@
+ 
+ // A failure names the piece, like src/linear.c's bad_args: the three linears carry their adapter stem (design §9.2), so
+ // a message points at the tensor and not only at this file.
++
++// ---- TEMPORARY PROFILER (JT_PROF_MLP=1; reverted before this change lands) ---------------------------------------------
++#include <stdlib.h>
++static int jtmp_on(void) {
++  static int v = -1;
++  if (v < 0) v = getenv("JT_PROF_MLP") != NULL;
++  return v;
++}
++enum { JTM_NORM, JTM_GATEUP, JTM_SILU, JTM_DOWN, JTM_RES, JTM_N };
++static const char *jtm_name[JTM_N] = {"mlp.fwd_norm", "mlp.fwd_gate+up linears", "mlp.fwd_silu_mul", "mlp.fwd_down linear",
++                                      "mlp.fwd_residual"};
++static cudaEvent_t jtm_ev[JTM_N];
++static double jtm_ms[JTM_N];
++static long jtm_n[JTM_N];
++static int jtm_ready;
++static void jtm_dump(void) {
++  fprintf(stderr, "jtmp: fwd GPU ms per phase (cuda events, one sync per phase):\n");
++  for (int i = 0; i < JTM_N; i++)
++    fprintf(stderr, "jtmp:   %-26s %9.3f ms  %6ld calls  %8.4f ms/call\n", jtm_name[i], jtm_ms[i], jtm_n[i],
++            jtm_n[i] ? jtm_ms[i] / (double)jtm_n[i] : 0.0);
++}
++static void jtm_setup(void) {
++  if (jtm_ready) return;
++  for (int i = 0; i < JTM_N; i++) cudaEventCreate(&jtm_ev[i]);
++  jtm_ready = 1;
++  atexit(jtm_dump);
++}
++static void jtm_mark(int i, cudaStream_t s) {
++  jtm_setup();
++  cudaEventRecord(jtm_ev[i], s);
++}
++static void jtm_acc(int slot, int from, int to) {
++  float ms = 0.0f;
++  cudaEventSynchronize(jtm_ev[to]);
++  if (cudaEventElapsedTime(&ms, jtm_ev[from], jtm_ev[to]) != cudaSuccess) ms = 0.0f;
++  jtm_ms[slot] += (double)ms;
++  jtm_n[slot]++;
++}
++#define JTM_MARK(i, st) do { if (jtmp_on()) jtm_mark((i), (st)); } while (0)
++#define JTM_ACC(slot, a, b) do { if (jtmp_on()) jtm_acc((slot), (a), (b)); } while (0)
++
+ static int bad_args(const char *fn, const char *why, const char *stem) {
+   fprintf(stderr, "layer_mlp: %s: %s (%s)\n", fn, why, stem != NULL ? stem : "?");
+   return JT_LAYER_FAIL;
+@@ -122,17 +163,28 @@ static int mlp_path(JtCtx *c, const LayerWeights *lw, const float *x_in, int n,
+   const size_t hidden_n = (size_t)n * MT_HIDDEN;
+   const size_t inter_n = (size_t)n * MT_MLP_INTER;
+ 
++  JTM_MARK(JTM_NORM, c->stream);
+   rmsnorm_fwd(x_in, lw->post_attn_norm, a->m, a->r, n, MT_HIDDEN, 1, c->stream); // 1: zero-centred (design §3.3)
++  JTM_MARK(JTM_GATEUP, c->stream);
++  JTM_ACC(JTM_NORM, JTM_NORM, JTM_GATEUP);
+   int rc = linear_fwd(c, &lw->gate, a->m, n, a->h1, a->u_gate);
+   if (rc == JT_LAYER_OK) rc = linear_fwd(c, &lw->up, a->m, n, a->h2, a->u_up);
+   if (rc != JT_LAYER_OK) return rc;
++  JTM_MARK(JTM_SILU, c->stream);
++  JTM_ACC(JTM_GATEUP, JTM_GATEUP, JTM_SILU);
+   k_silu_mul_fwd(a->h1, a->h2, a->act, (int)inter_n, c->stream);
++  JTM_MARK(JTM_DOWN, c->stream);
++  JTM_ACC(JTM_SILU, JTM_SILU, JTM_DOWN);
+   rc = linear_fwd(c, &lw->down, a->act, n, y, a->u_down);
+   if (rc != JT_LAYER_OK) return rc;
++  JTM_MARK(JTM_RES, c->stream);
++  JTM_ACC(JTM_DOWN, JTM_DOWN, JTM_RES);
+ 
+   if (x_out != x_in) // x_in was read once, by the norm above, so writing the residual now is safe in both aliasing cases
+     CK(cudaMemcpyAsync(x_out, x_in, hidden_n * sizeof(float), cudaMemcpyDeviceToDevice, c->stream));
+   jt_add_inplace(x_out, y, hidden_n, c->stream); // the residual (design §4.6)
++  JTM_MARK(JTM_N - 1, c->stream);
++  JTM_ACC(JTM_RES, JTM_RES, JTM_N - 1);
+   JT_SYNC_DEBUG; // a no-op unless -DJT_DEBUG=1, where it names a launch error at this line
+   return JT_LAYER_OK;
+ }
