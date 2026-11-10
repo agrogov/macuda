@@ -38,9 +38,17 @@
 #   test soft CE  score.py's calibrated jev_soft_ce, |d| <= 0.02                              (design §10.3.3)
 #   score.py metrics  every column of score.py's table, |d| <= the two-seed band: the spread of that same metric
 #                 across the arm's Python runs (the same arm at --seed 0 and --seed 1, design §10.3.3's "noise"),
-#                 floored at the measurement's own resolution: one test line = one card = 1/160 for ratios, 1 for
+#                 floored at the measurement's own resolution: one test line = one card = 1/160 for ratios, 2 for
 #                 counts. The floors keep a metric whose two seeds happen to agree exactly from demanding bit-equal
 #                 predictions; they do not touch the two CE gates above, which are the design's numbers.
+#                 THE COUNT FLOOR IS 2, NOT 1 (2026-11-10, the user's decision on G-m74). A count metric moves by two
+#                 lines whenever a prediction lands within rounding distance of the threshold on either side of it,
+#                 and a single line is below the resolution score.py's thresholds actually have: G-m74's card arms
+#                 matched the Python arm on every scored metric — precision, recall, F1, kind accuracy and tp/fp/fn
+#                 at both thresholds, some to the digit — and still missed th0.9.maybe_cards 5 vs 7, because two
+#                 lines both sides classify identically sat on opposite sides of the 0.9 boundary after TF32 rounding.
+#                 The floor was 1 line until this change; G-m64's gpubox arm passed under it, and G-m74's arms record
+#                 what the 1-line floor said in notes/G-m74.md so the decision can be read back.
 # The Python reference is the arm's own runs that are already on the box (data/ovril_detect/runs/cuda-<arm>-*, 2026-11-08
 # for soft). The primary is the one whose report.json args.seed equals this run's --seed, so the row order matches;
 # JT_PRIMARY_RUN names one explicitly, JT_REF_RUNS replaces the whole list.
@@ -257,7 +265,9 @@ metrics_ok = True
 for keys, kind in METRICS:
     vals = [leaf(r[1], keys) for r in refs]
     band = max(vals) - min(vals)
-    gate = max(band, 1.0 if kind == "count" else 1.0 / 160.0)  # one test line = one card = the resolution
+    # the resolution floors: a ratio moves in steps of one line (1/160); a count moves in cards, and one card is
+    # below what score.py's thresholds can resolve, so a count may drift by 2 (see the header's 2026-11-10 note)
+    gate = max(band, 2.0 if kind == "count" else 1.0 / 160.0)
     a, b = leaf(mine, keys), leaf(pscore, keys)
     delta, ok = abs(a - b), abs(a - b) <= gate
     metrics_ok = metrics_ok and ok
