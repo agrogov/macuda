@@ -3,12 +3,14 @@
 //
 //   zero / add_inplace / scale          residual bookkeeping (§8.1's last rows of the table)
 //   bf16_to_f32                         the top 16 bits widen to a float, nothing else (§8.1)
+//   f32_to_bf16                         the reverse (plan M8.1a): nearest-even; a NaN stays a quiet NaN
 //   embed_gather                        out[t,:] = float(table_bf16[ids[t],:]) (§8.1)
 //   qgate_split / qgate_merge           the per-head interleave of §3.5, the layout mistake that "still trains"
 //   kv_expand / kv_reduce               GQA group 4: forward copies a group into its 4 heads, backward sums them
 //   to_head_major / from_head_major     [L, H*D] <-> [H][L][D] for one row slice (§8.2)
 //
-// Everything is `real` (ref/real.h): float for the comparison against the kernel, double under -DJT_REAL_DOUBLE.
+// Everything is `real` (ref/real.h): float for the comparison against the kernel, double under -DJT_REAL_DOUBLE —
+// except the two bf16 boundaries, which are bit patterns in an unsigned short and so are not `real` at either end.
 #include <stdint.h>
 #include <string.h>
 
@@ -37,6 +39,34 @@ void ref_scale(real *x, real a, size_t n) {
 
 void ref_bf16_to_f32(const unsigned short *src, real *dst, size_t n) {
   for (size_t i = 0; i < n; i++) dst[i] = bf16_widen(src[i]);
+}
+
+// fp32 -> bf16, written out field by field so that it states the rule instead of a bit trick: keep the sign and the 8
+// exponent bits, keep the top 7 mantissa bits, and round by the 16 bits below them — up when they are more than half,
+// and at exactly half to the even mantissa. The carry after rounding is the correct answer at both ends of the range:
+// 0x7f7f + 1 is +inf, and a subnormal whose mantissa rounds out of the subnormal range becomes the smallest normal
+// (exponent field 0, and the carry sets it to 1). A NaN keeps its sign, keeps the 7 mantissa bits that fit and has the
+// quiet bit set — the same rule as test/harness.h's jt_f32_to_bf16, so a fixture built with that helper and this kernel
+// agree on every pattern, NaN included.
+static unsigned short bf16_from_f32_bits(uint32_t u) {
+  const uint32_t sign = u & 0x80000000u;
+  const uint32_t exp = (u >> 23) & 0xffu;
+  const uint32_t mant = u & 0x007fffffu;
+  if (exp == 0xffu) // inf keeps its sign; NaN: sign | 0x7f80 | the quiet bit | the payload that fits
+    return (unsigned short)((sign >> 16) | 0x7f80u | (mant == 0 ? 0u : (0x0040u | (mant >> 16))));
+  const uint32_t keep = mant >> 16;                // the 7 mantissa bits a bf16 keeps
+  const uint32_t rest = mant & 0xffffu;            // the 16 bits it rounds away
+  unsigned short out = (unsigned short)((sign >> 16) | (exp << 7) | keep);
+  if (rest > 0x8000u || (rest == 0x8000u && (keep & 1u) != 0)) out++; // nearest, ties to even
+  return out;
+}
+
+void ref_f32_to_bf16(const float *src, unsigned short *dst, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    uint32_t u;
+    memcpy(&u, &src[i], sizeof u); // the input's bits, not its value: no host rounding may touch them on the way
+    dst[i] = bf16_from_f32_bits(u);
+  }
 }
 
 void ref_embed_gather(const int *ids, const unsigned short *table_bf16, real *out, int n_tok, int d) {

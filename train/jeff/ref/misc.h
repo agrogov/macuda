@@ -22,6 +22,11 @@ void ref_add_inplace(real *y, const real *x, size_t n);
 void ref_scale(real *x, real a, size_t n);
 // dst[i] = float(bf16 src[i]): the top 16 bits, nothing else (design §8.1).
 void ref_bf16_to_f32(const unsigned short *src, real *dst, size_t n);
+// dst[i] = bf16(src[i]), the other direction (plan M8.1a): round to nearest, ties to even, and a NaN stays a quiet
+// NaN (its sign, and the 7 payload bits a bf16 has room for). This is the one reference here that narrows instead of
+// widening, so the test compares 16-bit patterns and not floats — and src is `const float *`, not `real *`, because it
+// is the kernel's fp32 input that is being rounded and the answer depends on those exact 32 bits.
+void ref_f32_to_bf16(const float *src, unsigned short *dst, size_t n);
 
 // ---- embedding lookup -----------------------------------------------------------------------------------------------
 // out[t, j] = float(table_bf16[ids[t], j]) for t < n_tok, j < d (d = 1024: design §3.2's embed_tokens).

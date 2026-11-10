@@ -64,6 +64,29 @@ __global__ void jt_bf16_to_f32_n_kernel(const unsigned short *src, float *dst, s
     dst[i] = __uint_as_float((unsigned int)src[i] << 16);
 }
 
+// fp32 -> bf16, the reverse (plan M8.1a): nearest, ties to even, on the integer bits. The classic rounding add is
+// `0x7fff + bit 16`: it carries into the kept mantissa exactly when the 16 dropped bits are more than half, or exactly
+// half and the surviving mantissa is odd (that is what makes a tie go to the even result). +-0, +-inf and the
+// subnormals all go through it untouched, and an exponent carry out of the mantissa is the right answer at both ends
+// (0x7f7f + 1 = +inf; a subnormal's 0x007f + 1 = 0x0080 = the smallest normal).
+// A NaN is tested first, because the add would carry its payload into an infinity: it keeps its sign and the 7 payload
+// bits a bf16 has room for, with the quiet bit set. That is the same rule as test/harness.h's jt_f32_to_bf16, and
+// deliberately NOT __float2bfloat16, whose NaN result is the hardware's business (0x7fff on sm_120) — with this the
+// 16-bit pattern is the same on every card and ref_f32_to_bf16 can be bit-exact.
+__device__ unsigned short jt_bf16_from_f32(float f) {
+  unsigned int u = __float_as_uint(f);
+  if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0)
+    return (unsigned short)((u >> 16) | 0x0040u);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (unsigned short)(u >> 16);
+}
+
+__global__ void jt_f32_to_bf16_n_kernel(const float *src, unsigned short *dst, size_t n) {
+  const size_t stride = (size_t)gridDim.x * blockDim.x;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride)
+    dst[i] = jt_bf16_from_f32(src[i]);
+}
+
 extern "C" void jt_zero(float *x, size_t n, cudaStream_t s) {
   if (n == 0) return;
   const int block = 256;
@@ -86,6 +109,12 @@ extern "C" void jt_bf16_to_f32_n(const unsigned short *src, float *dst, size_t n
   if (n == 0) return;
   const int block = 256;
   jt_bf16_to_f32_n_kernel<<<jt_grid_stride(n, block), block, 0, s>>>(src, dst, n);
+}
+
+extern "C" void jt_f32_to_bf16_n(const float *src, unsigned short *dst, size_t n, cudaStream_t s) {
+  if (n == 0) return;
+  const int block = 256;
+  jt_f32_to_bf16_n_kernel<<<jt_grid_stride(n, block), block, 0, s>>>(src, dst, n);
 }
 
 // ---- embed_gather: one block per token (design §8.1) ----------------------------------------------------------------

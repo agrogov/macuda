@@ -44,6 +44,12 @@ void jt_scale(float *x, float a, size_t n, cudaStream_t s);             // x[i] 
 // already owns the scalar helper jt_bf16_to_f32(unsigned short); this is the same widening, n elements at a time.
 void jt_bf16_to_f32_n(const unsigned short *src, float *dst, size_t n, cudaStream_t s);
 
+// fp32 -> bf16 for a whole buffer (plan M8.1a: the bf16 GEMM's operand, design §6.1's alignment rules). Round to
+// nearest, ties to even; a NaN stays a (quiet) NaN with its sign and the payload bits a bf16 has room for. The rounding
+// is integer arithmetic, not __float2bfloat16, whose NaN result is whatever the card's cvt does (sm_120 gives 0x7fff),
+// so the pattern is the same on every card — see kernels/misc.cu.
+void jt_f32_to_bf16_n(const float *src, unsigned short *dst, size_t n, cudaStream_t s);
+
 // ---- embedding lookup -----------------------------------------------------------------------------------------------
 // out[t, j] = float(table_bf16[ids[t], j]), t < n_tok, j < d. The table is [vocab, d] bf16 and is never converted
 // wholesale (248320 x 1024 would be 1 GB fp32); only the rows the batch uses are widened.

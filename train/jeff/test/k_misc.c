@@ -1,13 +1,16 @@
 // test/k_misc.c — the `misc` group of test_kernels (plan M2.1 on the plan M2.0 harness).
 //
 // The plumbing kernels of design §8.1, each against its CPU reference on the same random inputs: zero, add_inplace,
-// scale, bf16_to_f32, embed_gather, qgate_split/qgate_merge, kv_expand/kv_reduce, to_head_major/from_head_major.
+// scale, bf16_to_f32, f32_to_bf16, embed_gather, qgate_split/qgate_merge, kv_expand/kv_reduce,
+// to_head_major/from_head_major.
 // Every op here is a copy, a sum or a widen, so the forward gate is JT_TOL_FWD and the expected error is 0 — a nonzero
-// rel means a layout is wrong, not that rounding drifted.
+// rel means a layout is wrong, not that rounding drifted. f32_to_bf16 is the one op whose answer is a bit pattern, so it
+// is checked bit for bit instead (check_bits16).
 //
 // Two checks do not go through ref_* at all, because they are properties of the *pair* of kernels rather than of one:
 //   * qgate_merge(qgate_split(x)) == x  (the split/merge interleave is an identity on [rows, 4096])
 //   * <kv_expand(a), b> == <a, kv_reduce(b)>  (kv_reduce is the adjoint of kv_expand), rel < 1e-5
+// plus a third in the same spirit: bf16_to_f32(f32_to_bf16(x)) == x for every x a bf16 can hold.
 // Together with the ref comparison they pin the layout from two sides: a shared misunderstanding in ref/ shows up in
 // one of the two.
 //
@@ -339,6 +342,213 @@ static void t_head_major(int rows, int heads, uint32_t seed) {
   free(got);
 }
 
+// ---- f32_to_bf16 (plan M8.1a) --------------------------------------------------------------------------------------
+// The narrowing cast, checked on the cases where a rounding rule is what decides the answer: values exactly halfway
+// between two bf16s (ties must go to the even one), the ends of the range (denormals, ±0, ±inf, NaN), random values and
+// random fp32 bit patterns. Here the expected value is a 16-bit pattern, so the comparison is bit equality and not
+// rel_err: the kernel and ref_f32_to_bf16 have to produce the same pattern, a wrong NaN or a tie rounded the wrong way
+// included.
+static void check_bits16(const char *name, const unsigned short *got, const unsigned short *want, size_t n) {
+  if (jt_is_launch_only()) {
+    jt_report_launch_only(name);
+    return;
+  }
+  size_t bad = 0, first = 0;
+  for (size_t i = 0; i < n; i++)
+    if (got[i] != want[i]) {
+      if (bad == 0) first = i;
+      bad++;
+    }
+  if (bad) {
+    printf("  first mismatch at %zu: got 0x%04x want 0x%04x\n", first, (unsigned)got[first], (unsigned)want[first]);
+    fflush(stdout);
+  }
+  jt_report_abs(name, (double)bad, 0.5); // the count of differing patterns: 0 is the only pass
+}
+
+static void check_bits32(const char *name, const float *got, const float *want, size_t n) {
+  if (jt_is_launch_only()) {
+    jt_report_launch_only(name);
+    return;
+  }
+  size_t bad = 0, first = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint32_t g, w;
+    memcpy(&g, &got[i], sizeof g);
+    memcpy(&w, &want[i], sizeof w);
+    if (g != w) {
+      if (bad == 0) first = i;
+      bad++;
+    }
+  }
+  if (bad) {
+    uint32_t g, w;
+    memcpy(&g, &got[first], sizeof g);
+    memcpy(&w, &want[first], sizeof w);
+    printf("  first mismatch at %zu: got 0x%08x want 0x%08x\n", first, g, w);
+    fflush(stdout);
+  }
+  jt_report_abs(name, (double)bad, 0.5);
+}
+
+// A float from its bits, so that neither this compiler nor a library call can round a test input on the way in.
+static float f32_from_bits(uint32_t u) {
+  float f;
+  memcpy(&f, &u, sizeof f);
+  return f;
+}
+
+// One cast case: the kernel's patterns against ref_f32_to_bf16's on the same input.
+static void t_cast(const char *name, const float *x, size_t n) {
+  unsigned short *want = jtm_alloc(n * sizeof *want);
+  unsigned short *got = jtm_alloc(n * sizeof *got);
+  ref_f32_to_bf16(x, want, n);
+  float *dx = dev_upload(x, n);
+  unsigned short *dout = (unsigned short *)dev_alloc(n * sizeof *got);
+  jt_f32_to_bf16_n(dx, dout, n, 0);
+  dev_download_bytes(dout, got, n * sizeof *got);
+  check_bits16(name, got, want, n);
+  dev_free(dx);
+  dev_free(dout);
+  free(want);
+  free(got);
+}
+
+// The specials, as bits: both zeros, the denormals on both sides of the bf16 subnormal boundary, the halfway values that
+// make tie-to-even observable, ±inf and four NaNs. Every one of them is a case a value-range random fill cannot be
+// relied on to hit.
+static void t_cast_specials(void) {
+  static const uint32_t bits[] = {
+      0x00000000u, // +0
+      0x80000000u, // -0
+      0x00000001u, // the smallest fp32 denormal: far below half a bf16 denormal, rounds to +0
+      0x80000001u, // ... and its negative, which must round to -0 and not to +0
+      0x00008000u, // exactly half a bf16 denormal: a tie, and the even one is zero
+      0x0000ffffu, // just under one bf16 denormal: rounds up to it
+      0x00010000u, // the smallest bf16 denormal exactly: unchanged
+      0x00018000u, // the tie between it and the next one up: that one is even, so it wins
+      0x0001ffffu, // above that tie: rounds up to 0x0002
+      0x3f800000u, // 1.0, a bf16 exactly
+      0x3f807fffu, // just under the tie above 1.0: rounds down to 0x3f80
+      0x3f808000u, // the tie just above 1.0: the even bf16 (1.0) wins
+      0x3f818000u, // the tie one bf16 up: that one is odd, so it rounds up to 0x3f82
+      0xbf808000u, // ... and the same tie with the sign bit
+      0x3f80ffffu, // above that tie: rounds up to 0x3f81
+      0x3f810000u, // one bf16 ulp up: unchanged
+      0x3f7f8000u, // the tie just below 1.0: rounds up, and the carry changes the exponent
+      0x3f7fffffu, // above that tie, and just below 1.0: also rounds up to 0x3f80
+      0x7f7fffffu, // FLT_MAX: rounds up to +inf
+      0x7f800000u, // +inf
+      0xff800000u, // -inf
+      0x00800000u, // the smallest normal exponent
+      0x00400000u, // a normal fp32 that rounds to a bf16 denormal
+      0x7fc00000u, // a quiet NaN
+      0xffc00000u, // the same with the sign bit: a quiet NaN still
+      0x7f800001u, // a signalling NaN with the smallest payload
+      0x7fffffffu, // a NaN with every payload bit set
+  };
+  const size_t n = sizeof bits / sizeof bits[0];
+  float *x = jtm_alloc(n * sizeof *x);
+  for (size_t i = 0; i < n; i++) x[i] = f32_from_bits(bits[i]);
+  char name[96];
+  snprintf(name, sizeof name, "f32_to_bf16 specials n=%zu", n);
+  t_cast(name, x, n);
+  // n = 1 as well: one element is the shortest launch the grid-stride wrapper can make.
+  t_cast("f32_to_bf16 specials n=1", x, 1);
+  t_cast("f32_to_bf16 specials last-only n=1", x + n - 1, 1);
+  free(x);
+
+  // n = 0 is a no-op, like every wrapper here: the destination keeps whatever it held.
+  {
+    static const unsigned short before[4] = {0xdeadu, 0xbeefu, 0x1234u, 0x5678u};
+    unsigned short got[4];
+    float one = 1.0f;
+    float *dx = dev_upload(&one, 1);
+    unsigned short *dout = (unsigned short *)dev_upload_bytes(before, sizeof before);
+    memset(got, 0, sizeof got);
+    jt_f32_to_bf16_n(dx, dout, 0, 0);
+    dev_download_bytes(dout, got, sizeof got);
+    check_bits16("f32_to_bf16 n=0 is a no-op", got, before, 4);
+    dev_free(dx);
+    dev_free(dout);
+  }
+}
+
+// Random values of a weight's magnitude, then random fp32 bit patterns (uniform over the whole bit space, so they cover
+// every exponent, the denormals and the NaNs at their real rates). Neither length is a multiple of the kernel's 256
+// threads.
+static void t_cast_random(int n, uint32_t seed) {
+  if (n <= 0) return;
+  float *x = jtm_alloc((size_t)n * sizeof *x);
+  char name[96];
+
+  rnd_fill(x, n, -3.0, 3.0, seed);
+  snprintf(name, sizeof name, "f32_to_bf16 random n=%d", n);
+  t_cast(name, x, (size_t)n);
+
+  uint32_t s = seed + 1u;
+  for (int i = 0; i < n; i++) x[i] = f32_from_bits(jt_rng_u32(&s));
+  snprintf(name, sizeof name, "f32_to_bf16 random bits n=%d", n);
+  t_cast(name, x, (size_t)n);
+
+  free(x);
+}
+
+// Values exactly halfway between two neighbouring bf16s: the fp32 bits (b << 16) | 0x8000 for a bf16 pattern b, which is
+// where "ties to even" either happens or does not. The bf16 patterns with an all-ones exponent are skipped: inf and NaN
+// have no pair to sit between (that input is a NaN, and the NaN rule is covered by the specials).
+static void t_cast_halfway(int n, uint32_t seed) {
+  if (n <= 0) return;
+  float *x = jtm_alloc((size_t)n * sizeof *x);
+  uint32_t s = seed;
+  int k = 0;
+  while (k < n) {
+    const uint32_t b = jt_rng_below(&s, 0x10000u);
+    if (((b >> 7) & 0xffu) == 0xffu) continue;
+    const uint32_t sign = jt_rng_below(&s, 2u) != 0 ? 0x80000000u : 0u;
+    x[k++] = f32_from_bits(sign | (b << 16) | 0x8000u);
+  }
+  char name[96];
+  snprintf(name, sizeof name, "f32_to_bf16 halfway n=%d", n);
+  t_cast(name, x, (size_t)n);
+  free(x);
+}
+
+// The two kernels together are the identity on everything a bf16 can hold: the widening is exact, and the narrowing of
+// an exact value has nothing to round. NaN is excluded, because quieting a NaN is not a bit identity (its payload cannot
+// survive the narrowing); the cast's NaN rule is checked by the specials above. inf is included: it is its own pair.
+static void t_cast_roundtrip(int n, uint32_t seed) {
+  if (n <= 0) return;
+  static const unsigned short ends[] = {0x0000u, 0x8000u, 0x0001u, 0x8001u, 0x007fu, 0x0080u, 0x3f80u,
+                                        0xbf80u, 0x7f7fu, 0xff7fu, 0x7f80u, 0xff80u};
+  float *x = jtm_alloc((size_t)n * sizeof *x);
+  uint32_t s = seed;
+  int k = 0;
+  for (size_t i = 0; i < sizeof ends / sizeof ends[0] && k < n; i++) x[k++] = f32_from_bits((uint32_t)ends[i] << 16);
+  while (k < n) {
+    const uint32_t b = jt_rng_below(&s, 0x10000u);
+    if ((b & 0x7f80u) == 0x7f80u && (b & 0x007fu) != 0) continue; // a NaN: see above
+    x[k++] = f32_from_bits(b << 16);
+  }
+
+  float *got = jtm_alloc((size_t)n * sizeof *got);
+  float *dx = dev_upload(x, (size_t)n);
+  unsigned short *dbf = (unsigned short *)dev_alloc((size_t)n * sizeof *dbf);
+  float *dback = dev_alloc((size_t)n * sizeof *got);
+  jt_f32_to_bf16_n(dx, dbf, (size_t)n, 0);
+  jt_bf16_to_f32_n(dbf, dback, (size_t)n, 0);
+  dev_download(dback, got, (size_t)n);
+  char name[96];
+  snprintf(name, sizeof name, "f32_to_bf16->bf16_to_f32 identity n=%d", n);
+  check_bits32(name, got, x, (size_t)n);
+
+  dev_free(dx);
+  dev_free(dbf);
+  dev_free(dback);
+  free(x);
+  free(got);
+}
+
 int k_misc(void) {
   int off[JT_RAGGED4_ROWS + 1];
   const int n3 = jt_ragged(jt_lens_ragged3(), JT_RAGGED3_ROWS, off, NULL);   // 168
@@ -346,6 +556,17 @@ int k_misc(void) {
 
   t_elementwise(n3, 101u);
   t_elementwise(n4, 102u);
+
+  // M8.1a's cast: the specials and the halfway values first (they are the cases a random fill can miss), then the two
+  // ragged lengths, which are not multiples of the kernel's block, for the random and the round-trip checks.
+  t_cast_specials();
+  t_cast_random(n3, 115u);
+  t_cast_random(n4, 116u);
+  t_cast_halfway(n3, 117u);
+  t_cast_halfway(n4, 118u);
+  t_cast_roundtrip(1, 119u);
+  t_cast_roundtrip(n3, 120u);
+  t_cast_roundtrip(n4, 121u);
 
   t_embed(n3, 32, JT_HIDDEN, 103u);   // the model's width ...
   t_embed(n4, 64, 100, 104u);         // ... and a width that is not a multiple of the block's 256 threads
