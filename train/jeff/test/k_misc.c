@@ -31,6 +31,10 @@
 #define KVH JT_ATTN_KV_HEADS
 #define KVG JT_ATTN_KV_GROUP
 
+// The arm's largest batch shape (notes/J39: batch 8 of 256 train rows, max_tokens_per_batch 5750). The transposes see
+// one row slice at a time, so this is a stress size for the same kernel, not a real single row (max_len is 795).
+#define ARM_MAX_TOKENS 5750
+
 static void *jtm_alloc(size_t nbytes) {
   void *p = malloc(nbytes ? nbytes : 1);
   if (p == NULL) {
@@ -288,40 +292,40 @@ static void t_kv(int rows, uint32_t seed) {
 }
 
 // ---- to_head_major / from_head_major --------------------------------------------------------------------------------
-static void t_head_major(int rows, uint32_t seed) {
-  if (rows <= 0) return;
-  const size_t n = (size_t)rows * (size_t)ATTN_H * (size_t)ATTN_D; // [rows, 2048] <-> [8][rows][256]
+static void t_head_major(int rows, int heads, uint32_t seed) {
+  if (rows <= 0 || heads <= 0) return;
+  const size_t n = (size_t)rows * (size_t)heads * (size_t)ATTN_D; // [rows, heads*256] <-> [heads][rows][256]
   float *x = jtm_alloc(n * sizeof *x);
   float *want_y = jtm_alloc(n * sizeof *want_y);
   float *want_x = jtm_alloc(n * sizeof *want_x);
   float *got = jtm_alloc(n * sizeof *got);
-  char name[80];
+  char name[96];
 
   rnd_fill(x, n, -1.0, 1.0, seed);
 
-  ref_to_head_major(x, want_y, rows, ATTN_H, ATTN_D);
+  ref_to_head_major(x, want_y, rows, heads, ATTN_D);
   float *dx = dev_upload(x, n);
   float *dy = dev_alloc(n * sizeof *got);
-  jt_to_head_major(dx, dy, rows, ATTN_H, ATTN_D, 0);
+  jt_to_head_major(dx, dy, rows, heads, ATTN_D, 0);
   dev_download(dy, got, n);
-  snprintf(name, sizeof name, "to_head_major rows=%d", rows);
+  snprintf(name, sizeof name, "to_head_major rows=%d heads=%d", rows, heads);
   CHECK_REL(name, got, want_y, n, JT_TOL_FWD);
 
   // from_head_major: the other direction, its own random input.
   float *y = jtm_alloc(n * sizeof *y);
   rnd_fill(y, n, -1.0, 1.0, seed + 1);
-  ref_from_head_major(y, want_x, rows, ATTN_H, ATTN_D);
+  ref_from_head_major(y, want_x, rows, heads, ATTN_D);
   float *dy_in = dev_upload(y, n);
   float *dx_out = dev_alloc(n * sizeof *got);
-  jt_from_head_major(dy_in, dx_out, rows, ATTN_H, ATTN_D, 0);
+  jt_from_head_major(dy_in, dx_out, rows, heads, ATTN_D, 0);
   dev_download(dx_out, got, n);
-  snprintf(name, sizeof name, "from_head_major rows=%d", rows);
+  snprintf(name, sizeof name, "from_head_major rows=%d heads=%d", rows, heads);
   CHECK_REL(name, got, want_x, n, JT_TOL_FWD);
 
   // Round trip on the device: from_head_major(to_head_major(x)) == x, against the untouched input.
-  jt_from_head_major(dy, dx_out, rows, ATTN_H, ATTN_D, 0);
+  jt_from_head_major(dy, dx_out, rows, heads, ATTN_D, 0);
   dev_download(dx_out, got, n);
-  snprintf(name, sizeof name, "from(to(x))==x rows=%d", rows);
+  snprintf(name, sizeof name, "from(to(x))==x rows=%d heads=%d", rows, heads);
   CHECK_REL(name, got, x, n, JT_TOL_FWD);
 
   dev_free(dx);
@@ -354,9 +358,16 @@ int k_misc(void) {
   t_kv(n3, 109u);
   t_kv(n4, 110u);
 
-  t_head_major(1, 111u);
-  t_head_major(n3, 112u);
-  t_head_major(n4, 113u);
+  // The transposes launch one block per (head, token tile), so walk both sides of a tile boundary, the model's head
+  // count and both sides of it, and the arm's largest batch shape. Every case also checks the round trip above.
+  {
+    static const int hm_heads[] = {1, 2, ATTN_H, 16};
+    static const int hm_rows[] = {1, JT_MISC_TILE - 1, JT_MISC_TILE + 1, ARM_MAX_TOKENS};
+    uint32_t hm_seed = 111u;
+    for (size_t hi = 0; hi < sizeof hm_heads / sizeof hm_heads[0]; hi++)
+      for (size_t ri = 0; ri < sizeof hm_rows / sizeof hm_rows[0]; ri++)
+        t_head_major(hm_rows[ri], hm_heads[hi], hm_seed++);
+  }
 
   return jt_exit_code();
 }

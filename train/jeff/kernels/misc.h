@@ -23,6 +23,11 @@
 #define JT_ATTN_KV_W (JT_ATTN_KV_HEADS * JT_ATTN_HEAD_DIM)      // 512   k_proj / v_proj columns
 #define JT_ATTN_KV_EXPANDED_W (JT_ATTN_KV_W * JT_ATTN_KV_GROUP) // 2048  after kv_expand
 
+// The head-major transposes and kv_expand walk the token axis in tiles of this many rows, one block per (head, tile),
+// so their launch covers the whole GPU rather than one block per head. Exported so test/k_misc.c can exercise both
+// sides of a tile boundary instead of a magic number.
+#define JT_MISC_TILE 16
+
 #ifdef __cplusplus
 extern "C" {
 #endif
