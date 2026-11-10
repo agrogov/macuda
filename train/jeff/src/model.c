@@ -17,6 +17,11 @@
 // (design §10.2): the mixer writes x_out = x_in + Mixer(RMSNorm(x_in)), the MLP adds its own path on top. Neither piece
 // keeps anything during the forward sweep; the backward recomputes each layer from its saved input (design §6.2, the
 // layer-level recompute — model_backward below).
+//
+// Plan M8 item 4 adds the other side of that trade: with --no-recompute (JT_NO_RECOMPUTE=1) the forward sweep keeps every
+// layer's saves in a "store" appended to the arena, so the backward reads them where the forward left them and re-runs
+// nothing — one forward less per step, at 3.2 MB of device memory per packed token. The section before jt_ctx_alloc has
+// the layout and the reasons.
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
@@ -352,6 +357,199 @@ void jt_batch_free(JtBatch *b) {
   b->row_of = NULL;
 }
 
+// ---- --no-recompute: keep every layer's forward saves (plan M8 item 4) -----------------------------------------------
+// Design §6.2's layer recompute re-runs each layer's forward in front of its backward: one extra forward per step (about
+// +33% time, D§6.2) and only one layer's scratch on the device. `--no-recompute` (JT_NO_RECOMPUTE=1, the environment the
+// parity scripts can be re-run with) trades memory for that time: the forward sweep runs every layer in JT_FWD_SAVE mode
+// and leaves its saves where its backward reads them, so the backward re-runs nothing: plan M8 budgets −25% time, and the
+// measured pair on gpubox's 5090 is 1.127 -> 0.778 s/step (−31%, the recomputed forward's 0.349 s) for 29.56 GB of peak
+// against 7.84 (J39).
+//
+// The saves cannot live in the one arena: 24 layers of them are 0.81 M floats per packed token (below), eight times the
+// per-token budget the arena has, so the context allocates a second region, the "store", appended to the arena **in the
+// same cudaMalloc**. For a batch of n tokens it is laid out as
+//
+//     [ pm_0 .. pm_23 ][ saves_0 | saves_1 | ... | saves_23 ][ gdn ckpt_0 .. ckpt_17 ][ one layer's work ]
+//       n * HIDDEN each       n * (this layer's width)          cap_rows sized          the arena's own width
+//
+// (`pm_i` is layer i's post-mixer residual, which its MLP backward takes as its input x; the GDN checkpoint slots exist
+// because c->gdn_ckpt is one buffer that every GDN layer's forward would otherwise overwrite.) Two properties keep the
+// rest of this file free of new state:
+//
+//   * a backward's saves always start at the arena's base (the three pieces' convention, src/layer.h), so the layer loop
+//     moves c->arena to the layer's slot and c->arena_n to "the store's top minus that slot". Work then comes from the
+//     region at the top — jt_work_alloc returns c->arena + work_at = top - n, which is the same address for every layer —
+//     and the arena's own guard, work_at - save_at, is exactly the room between this layer's saves and that same top.
+//   * the store needs no field and no global to be found: it sits directly above the arena in the same allocation, so its
+//     size and its base are pure functions of the capacities and `no_recompute(c)` is the accounting identity
+//     arena_n == base_arena_floats(c) + store_floats(c). Nothing outside this file has to know the mode is on.
+//
+// The work region is shared by all 24 layers because only one layer is ever live, and it is one arena wide — saves plus
+// work for the widest layer — so a piece's temporaries can only leave it if the arena itself is too small, which the
+// recompute path refuses first.
+
+// One layer's saved words per packed token, from the pieces' own layouts: src/layer_mlp.c's saves_floats() (11,825),
+// src/layer_gdn.c's walk() (23,697) and src/layer_attn.c's attn_save_ptrs() (12,875). Written as the same sums of the
+// model's widths so they can be checked against those functions line by line, and `store_check` compares the save cursor
+// with them after every SAVE pass of every step: a piece that grows a saved buffer stops this mode with both numbers
+// instead of letting one layer's slots overlap the next.
+#define JT_MLP_SAVES_PER_TOKEN ((size_t)MT_HIDDEN + 1 + 3 * (size_t)MT_MLP_INTER + 3 * (size_t)MT_LORA_RANK)
+#define JT_GDN_SAVES_PER_TOKEN                                                                                          \
+  ((size_t)MT_HIDDEN + 1 + 3 * (size_t)MT_LORA_RANK + 3 * (size_t)MT_GDN_HEADS + (size_t)MT_GDN_QKV_OUT +              \
+   3 * (size_t)MT_GDN_Z_OUT + 2 * (size_t)MT_GDN_Z_OUT + 2 * (size_t)MT_GDN_HEADS + 3 * (size_t)MT_GDN_Z_OUT +         \
+   (size_t)MT_GDN_HEADS)
+#define JT_ATTN_SAVES_PER_TOKEN                                                                                         \
+  (1 + (size_t)MT_HIDDEN + (size_t)MT_Q_OUT + 3 * (size_t)MT_O_IN + (size_t)MT_FULL_HEADS + (size_t)MT_KV_HEADS +      \
+   3 * (size_t)MT_KV_OUT + 4 * (size_t)MT_LORA_RANK)
+_Static_assert(JT_MLP_SAVES_PER_TOKEN == 11825, "src/layer_mlp.c's saves_floats() no longer agrees with this file");
+_Static_assert(JT_GDN_SAVES_PER_TOKEN == 23697, "src/layer_gdn.c's walk() no longer agrees with this file");
+_Static_assert(JT_ATTN_SAVES_PER_TOKEN == 12875, "src/layer_attn.c's attn_save_ptrs() no longer agrees with this file");
+
+static size_t mixer_saves_per_token(const MtLayer *ml) {
+  return ml->full_attention ? JT_ATTN_SAVES_PER_TOKEN : JT_GDN_SAVES_PER_TOKEN;
+}
+static size_t layer_saves_per_token(const MtLayer *ml) { return mixer_saves_per_token(ml) + JT_MLP_SAVES_PER_TOKEN; }
+
+// The arena the context has without a store (plan M0.1/M4.3 unchanged): one layer's saves and work for the widest batch,
+// plus one row's P and dP (design §6.2).
+static size_t base_arena_floats(const JtCtx *c) {
+  return (size_t)c->cap_tokens * JT_ARENA_FLOATS_PER_TOKEN +
+         2 * (size_t)MT_FULL_HEADS * (size_t)c->lmax * (size_t)c->lmax;
+}
+
+// The store's words per packed token, all 24 layers' saves and pm slabs: 0.81 M, i.e. 3.25 MB, which is what the mode
+// costs and what the start-up line prints (plan rule 6: memory is the reason this one is opt-in).
+static size_t store_floats_per_token(void) {
+  size_t n = (size_t)MT_LAYERS * MT_HIDDEN;
+  for (int i = 0; i < MT_LAYERS; i++) n += layer_saves_per_token(mt_layer(i));
+  return n;
+}
+
+// How many packed tokens the store was sized for. The context's cap_tokens is the widest batch of *any* split, and a run's
+// widest is usually a dev check's (train.py's dev batches are twice the training batch) — a forward-only pass that has no
+// backward to feed. So main.c hands over the train split's max_tokens_per_batch as JT_NO_RECOMPUTE_TOKENS and that is the
+// number the store is sized for; a batch bigger than it takes the recompute path in *both* sweeps (model_forward and
+// model_backward ask this same question), which is exactly the pre-M8 behaviour and needs no store at all.
+static int store_tokens(const JtCtx *c) {
+  const char *s = getenv("JT_NO_RECOMPUTE_TOKENS");
+  if (s == NULL) return c->cap_tokens;
+  char *end = NULL;
+  const long v = strtol(s, &end, 10);
+  if (end == s || v < 1) return c->cap_tokens;
+  return (int)(v < (long)c->cap_tokens ? v : (long)c->cap_tokens);
+}
+
+// One GDN checkpoint slot per GDN layer (c->gdn_ckpt is one buffer, and every GDN layer's forward would overwrite it).
+static size_t store_ckpt_floats(const JtCtx *c) {
+  return (size_t)c->model->n_gdn * gdn_ckpt_floats(c->cap_rows, MT_GDN_HEADS, c->gdn_nseg);
+}
+
+// The shared work region: one arena's worth at the store's token count, because a piece's temporaries are bounded by
+// `JT_ARENA_FLOATS_PER_TOKEN` per token and by one row's P and dP (design §6.2's per-token budget), and the arena itself
+// reserves those bytes below its own saves.
+static size_t store_work_floats(const JtCtx *c) {
+  const size_t t = (size_t)store_tokens(c);
+  return t * JT_ARENA_FLOATS_PER_TOKEN + 2 * (size_t)MT_FULL_HEADS * (size_t)c->lmax * (size_t)c->lmax;
+}
+
+// The store's whole size: the pm slabs and save slots for `store_tokens` tokens, the GDN checkpoint slots, the work region.
+static size_t store_floats(const JtCtx *c) {
+  return store_floats_per_token() * (size_t)store_tokens(c) + store_ckpt_floats(c) + store_work_floats(c);
+}
+
+// The mode's switch, in the environment as JT_EXACT and JT_GDN_CHUNKED are: main.c's --no-recompute sets it before the
+// context is allocated, and the parity scripts can re-gate the mode without a flag. "0", or nothing, is off.
+static int no_recompute_env(void) {
+  const char *s = getenv("JT_NO_RECOMPUTE");
+  return s != NULL && s[0] != '\0' && strcmp(s, "0") != 0;
+}
+
+// Is the store there? c->arena_n is base + store when it is (jt_ctx_alloc), so this is the allocation's own bookkeeping and
+// not a flag someone has to keep in step. Call it before moving the arena (store_bind changes arena_n).
+static int no_recompute(const JtCtx *c) { return c->arena_n > base_arena_floats(c); }
+
+// Does this batch go through the store? Both sweeps ask this one question, so the forward cannot keep saves that the
+// backward then recomputes over (or the other way round): a batch above the store's token count — a dev check's — is the
+// recompute path in both.
+static int store_serves(const JtCtx *c, int n) { return no_recompute(c) && n <= store_tokens(c); }
+
+// A batch's view of the store: its first word and the top every layer's work grows down from. `n` is this batch's token
+// count, and the save slots follow it (they are n * a per-token width), so a smaller batch than cap_tokens simply leaves
+// the tail of the region unused.
+typedef struct {
+  float *base; // the store's first word
+  float *top;  // one past its last word (the work half's ceiling)
+  int n;
+} Store;
+
+static size_t store_pm_off(int i, int n) { return (size_t)i * (size_t)n * MT_HIDDEN; }
+static size_t store_slot_off(int i, int n) {
+  size_t off = (size_t)MT_LAYERS * (size_t)n * MT_HIDDEN;
+  for (int j = 0; j < i; j++) off += layer_saves_per_token(mt_layer(j)) * (size_t)n;
+  return off;
+}
+static size_t store_ckpt_off(const JtCtx *c, int gdn_index, int n) {
+  size_t off = (size_t)MT_LAYERS * (size_t)n * MT_HIDDEN;
+  for (int j = 0; j < MT_LAYERS; j++) off += layer_saves_per_token(mt_layer(j)) * (size_t)n;
+  return off + (size_t)gdn_index * gdn_ckpt_floats(c->cap_rows, MT_GDN_HEADS, c->gdn_nseg);
+}
+
+// Everything store_bind and the GDN checkpoint swap move, so a sweep can put the context back the way it found it (the head
+// uses the arena's base between the sweeps, src/head.c).
+typedef struct {
+  float *arena, *gdn_ckpt;
+  size_t arena_n, save_at, work_at;
+} ArenaKeep;
+
+static void arena_keep(const JtCtx *c, ArenaKeep *k) {
+  k->arena = c->arena, k->gdn_ckpt = c->gdn_ckpt;
+  k->arena_n = c->arena_n, k->save_at = c->save_at, k->work_at = c->work_at;
+}
+
+static void arena_restore(JtCtx *c, const ArenaKeep *k) {
+  c->arena = k->arena, c->gdn_ckpt = k->gdn_ckpt;
+  c->arena_n = k->arena_n, c->save_at = k->save_at, c->work_at = k->work_at;
+}
+
+// Point the arena at `off` words into the store with the save cursor at `save_at` words (0 for a fresh block, the mixer's
+// width when the block is the MLP's, which sits above it in the same slot). Work keeps coming from the store's top.
+static void store_bind(JtCtx *c, const Store *p, size_t off, size_t save_at) {
+  c->arena = p->base + off;
+  c->arena_n = (size_t)(p->top - c->arena);
+  c->save_at = save_at;
+  c->work_at = c->arena_n;
+}
+
+// Does the batch fill what jt_ctx_alloc sized? The save slots are sized for store_tokens(c), the ckpt slots for cap_rows,
+// and the work region for one arena at store_tokens(c). Both sweeps ask store_tokens first (a batch above it takes the
+// recompute path), so the checks here only catch a bookkeeping mistake, and they say which number was wrong.
+static void store_open(const JtCtx *c, Store *p, const JtBatch *b, int n) {
+  if (n != b->n) die("store: %d tokens but the batch has %d", n, b->n);
+  if (!no_recompute(c)) die("store: opened without a store (was jt_ctx_alloc asked for --no-recompute?)");
+  if (n > store_tokens(c))
+    die("store: %d tokens, the store was sized for %d (JT_NO_RECOMPUTE_TOKENS: main.c passes the train split's "
+        "max_tokens_per_batch)",
+        n, store_tokens(c));
+  if (b->rows > c->cap_rows) die("store: %d rows, the context was sized for %d", b->rows, c->cap_rows);
+  const size_t saves_pm = store_floats_per_token() * (size_t)n;
+  if (saves_pm + store_ckpt_floats(c) > store_floats(c) - store_work_floats(c))
+    die("store: %zu floats of slots and %zu of checkpoints do not fit under the %zu-word work region",
+        saves_pm, store_ckpt_floats(c), store_work_floats(c));
+  const size_t have = (size_t)(c->arena_n - base_arena_floats(c)); // store_floats(c)
+  p->base = c->arena + base_arena_floats(c);
+  p->top = p->base + have;
+  p->n = n;
+}
+
+// The save cursor after a SAVE pass must be the width this file budgets for that piece: if a piece's layout changed, stop
+// here, at the first step, with both numbers instead of letting a slot overlap its neighbour.
+static void store_check(const char *piece, int layer, size_t got, size_t want) {
+  if (got == want) return;
+  die("layer %d's %s saves are %zu floats, --no-recompute budgets %zu (that piece's save layout changed: update the "
+      "*_SAVES_PER_TOKEN sums above)",
+      layer, piece, got, want);
+}
+
 // ---- the context and the activation arena (design §6.2) ---------------------------------------------------------------
 JtCtx *jt_ctx_alloc(Model *m, Lora *l, int cap_tokens, int cap_rows, int lmax) {
   if (m == NULL || l == NULL) die("jt_ctx_alloc: the model and the flat parameter buffer are both required");
@@ -381,14 +579,20 @@ JtCtx *jt_ctx_alloc(Model *m, Lora *l, int cap_tokens, int cap_rows, int lmax) {
   free(hc);
   free(hs);
 
-  c->arena_n = (size_t)cap_tokens * JT_ARENA_FLOATS_PER_TOKEN +
-               2 * (size_t)MT_FULL_HEADS * (size_t)lmax * (size_t)lmax; // one row's P and dP (design §6.2)
-  CK(cudaMalloc((void **)&c->arena, c->arena_n * sizeof(float)));
-  c->save_at = 0;
-  c->work_at = c->arena_n;
-
   c->gdn_nseg = (lmax + JT_GDN_SEG - 1) / JT_GDN_SEG;
-  if (c->gdn_nseg < 1) c->gdn_nseg = 1;
+  if (c->gdn_nseg < 1) c->gdn_nseg = 1; // the store's ckpt slots are sized from it, so it comes before the arena
+
+  // One allocation holds the arena and, with --no-recompute, the store directly above it (the section above). c->arena_n is
+  // the whole allocation's size in that mode, which is how every later call knows the store is there.
+  const size_t arena_base = base_arena_floats(c);
+  const int store = no_recompute_env();
+  c->arena_n = arena_base;
+  if (store) c->arena_n += store_floats(c);
+  CK(cudaMalloc((void **)&c->arena, c->arena_n * sizeof(float)));
+  c->work_at = arena_base;
+  c->save_at = 0;
+  const size_t store_n = c->arena_n - arena_base;
+
   const size_t ckpt = gdn_ckpt_floats(cap_rows, MT_GDN_HEADS, c->gdn_nseg);
   const size_t sp = gdn_bwd_sp_floats(cap_rows, MT_GDN_HEADS);
   const size_t part = gdn_bwd_part_floats((size_t)cap_tokens, MT_GDN_HEADS);
@@ -401,8 +605,14 @@ JtCtx *jt_ctx_alloc(Model *m, Lora *l, int cap_tokens, int cap_rows, int lmax) {
   CK(cudaMalloc((void **)&c->gdn_work.dg_part, gate * sizeof(float)));
 
   printf("ctx: lmax %d, arena %.2f GB fp32 (%d tokens x %zu floats + 2 x %d x %d^2), gdn nseg %d, ckpt %.2f GB, bwd scratch %.2f GB\n",
-         lmax, (double)c->arena_n * sizeof(float) / 1e9, cap_tokens, JT_ARENA_FLOATS_PER_TOKEN, MT_FULL_HEADS, lmax,
+         lmax, (double)arena_base * sizeof(float) / 1e9, cap_tokens, JT_ARENA_FLOATS_PER_TOKEN, MT_FULL_HEADS, lmax,
          c->gdn_nseg, (double)ckpt * sizeof(float) / 1e9, (double)(sp + 2 * part + 2 * gate) * sizeof(float) / 1e9);
+  if (store)
+    printf("ctx: no-recompute (JT_NO_RECOMPUTE): every layer's forward saves are kept, store %.2f GB on top of the arena "
+           "for batches of up to %d tokens (%.2f KB per packed token: %d layers' saves + their post-mixer residuals, %d "
+           "GDN checkpoint slots, one shared work region); a bigger batch takes the recompute path\n",
+           (double)store_n * sizeof(float) / 1e9, store_tokens(c),
+           (double)store_floats_per_token() * sizeof(float) / 1024.0, MT_LAYERS, m->n_gdn);
   fflush(stdout);
   // One device-wide barrier, once, after the load: everything before this point uploaded with plain cudaMemcpy on the
   // null stream (model_load, lora_load_adapter, jt_batch_set), and ctx->stream is a *non-blocking* one (design §12), which
@@ -489,11 +699,85 @@ int layer_bwd(JtCtx *c, int i, const float *x_in, const float *post_mixer, float
   return rc;
 }
 
+// ---- the two sweeps with the store (plan M8 item 4) ---------------------------------------------------------------------
+// --no-recompute's forward: every layer runs in JT_FWD_SAVE and its saves land in its own slot, at the offsets its backward
+// will bind them from (the mixer's half at the slot's base, the MLP's above it). Nothing is copied afterwards and nothing
+// is recomputed later, which is the whole of the mode. The mixer's output IS the layer's post-mixer residual, so it is
+// written straight into `pm`: the caller's `post_mixer` slab when there is one (--dump-backward's key) and the store's
+// otherwise, and the MLP then continues from it exactly as layer_fwd does.
+static int store_forward(JtCtx *c, const Store *st, const JtBatch *b, float *saved_in, float *post_mixer) {
+  const int n = st->n;
+  const size_t stride = (size_t)n * MT_HIDDEN;
+  int gdn_index = 0;
+  for (int i = 0; i < MT_LAYERS; i++) {
+    const MtLayer *ml = mt_layer(i);
+    const LayerWeights *lw = &c->model->layers[i];
+    const float *x_in = saved_in + (size_t)i * stride;
+    float *pm = post_mixer != NULL ? post_mixer + (size_t)i * stride : st->base + store_pm_off(i, n);
+    const size_t slot = store_slot_off(i, n);
+    const size_t mixer = mixer_saves_per_token(ml) * (size_t)n;
+
+    store_bind(c, st, slot, 0); // the mixer's saves at the slot's base, its work from the store's top
+    if (!ml->full_attention) c->gdn_ckpt = st->base + store_ckpt_off(c, gdn_index++, n);
+    int rc = ml->full_attention ? layer_attn_mixer_fwd(c, lw, x_in, n, b, pm, JT_FWD_SAVE)
+                                : layer_gdn_mixer_fwd(c, lw, x_in, n, b, pm, JT_FWD_SAVE);
+    if (rc != JT_LAYER_OK) return rc;
+    store_check("mixer", i, c->save_at, mixer);
+
+    store_bind(c, st, slot + mixer, 0); // the MLP's saves directly above the mixer's, its work from the same top
+    rc = layer_mlp_fwd(c, lw, pm, n, b, saved_in + (size_t)(i + 1) * stride, JT_FWD_SAVE);
+    if (rc != JT_LAYER_OK) return rc;
+    store_check("MLP", i, c->save_at, JT_MLP_SAVES_PER_TOKEN * (size_t)n);
+  }
+  return JT_LAYER_OK;
+}
+
+// --no-recompute's backward: the same loop as model_backward's, with the recompute replaced by a jump to the layer's slot.
+// The two halves keep the order the maths needs (the MLP's path first, then the mixer's, since the mixer's dy is the sum of
+// both) and each binds its saves where store_forward left them, so nothing here recomputes anything.
+static int store_backward(JtCtx *c, const Store *st, const JtBatch *b, const float *saved_in, float *post_mixer,
+                          float *grad_out, float *dres) {
+  const int n = st->n;
+  const size_t stride = (size_t)n * MT_HIDDEN;
+  int gdn_index = c->model->n_gdn;
+  for (int i = MT_LAYERS - 1; i >= 0; i--) {
+    const MtLayer *ml = mt_layer(i);
+    const LayerWeights *lw = &c->model->layers[i];
+    const float *x_in = saved_in + (size_t)i * stride;
+    float *pm = post_mixer != NULL ? post_mixer + (size_t)i * stride : st->base + store_pm_off(i, n);
+    const size_t slot = store_slot_off(i, n);
+    const size_t mixer = mixer_saves_per_token(ml) * (size_t)n;
+    if (!ml->full_attention) gdn_index--;
+    if (grad_out != NULL) // grad.layer.{i}.out: the entry value, before any backward writes dres
+      CK(cudaMemcpyAsync(grad_out + (size_t)i * stride, dres, stride * sizeof(float), cudaMemcpyDeviceToDevice, c->stream));
+
+    store_bind(c, st, slot + mixer, 0); // the MLP's block, at its own base (jt_saves_reset + the block's own width)
+    int rc = layer_mlp_bwd(c, lw, pm, dres, n, b);
+    if (rc != JT_LAYER_OK) return rc;
+
+    store_bind(c, st, slot, mixer); // the mixer's block at the slot's base, the cursor where its replay expects it
+    if (!ml->full_attention) c->gdn_ckpt = st->base + store_ckpt_off(c, gdn_index, n);
+    rc = ml->full_attention ? layer_attn_mixer_bwd(c, lw, x_in, dres, n, b)
+                            : layer_gdn_mixer_bwd(c, lw, x_in, dres, n, b);
+    if (rc != JT_LAYER_OK) return rc;
+  }
+  return JT_LAYER_OK;
+}
+
 int model_forward(JtCtx *c, const int *ids, int n, const JtBatch *b, float *saved_in, float *post_mixer) {
   if (c == NULL || ids == NULL || b == NULL || saved_in == NULL) die("model_forward: bad arguments");
   if (n != b->n) die("model_forward: n %d but the batch has %d tokens", n, b->n);
   const size_t stride = (size_t)n * MT_HIDDEN;
   jt_embed_gather(ids, c->model->embed, saved_in, n, MT_HIDDEN, c->stream); // design §8.1: only the used rows widen
+  if (store_serves(c, n)) { // plan M8 item 4: keep every layer's saves for the backward (the section above)
+    Store st;
+    store_open(c, &st, b, n);
+    ArenaKeep keep;
+    arena_keep(c, &keep);
+    const int rc = store_forward(c, &st, b, saved_in, post_mixer);
+    arena_restore(c, &keep);
+    return rc;
+  }
   for (int i = 0; i < MT_LAYERS; i++) {
     const float *in = saved_in + (size_t)i * stride;
     float *out = saved_in + (size_t)(i + 1) * stride;
@@ -532,11 +816,23 @@ int model_forward(JtCtx *c, const int *ids, int n, const JtBatch *b, float *save
 // The scratch (the recompute's output, one slab for post_mixer when the caller has no buffer, and the park) comes from the
 // arena's work half and is given back before returning; each half's own saves and temporaries are bracketed by the piece
 // that takes them. No allocation happens here.
+//
+// With --no-recompute (plan M8 item 4) there is no recompute: model_forward kept every layer's saves in the store, so this
+// is store_backward's loop instead — the same order and the same backwards, one forward cheaper per layer.
 int model_backward(JtCtx *c, const float *saved_in, int n, const JtBatch *b, float *post_mixer, float *grad_out,
                    float *dres) {
   if (c == NULL || c->model == NULL || saved_in == NULL || b == NULL || dres == NULL)
     die("model_backward: bad arguments");
   if (n != b->n) die("model_backward: n %d but the batch has %d tokens", n, b->n);
+  if (store_serves(c, n)) {
+    Store st;
+    store_open(c, &st, b, n);
+    ArenaKeep keep;
+    arena_keep(c, &keep);
+    const int rc = store_backward(c, &st, b, saved_in, post_mixer, grad_out, dres);
+    arena_restore(c, &keep);
+    return rc;
+  }
   const size_t stride = (size_t)n * MT_HIDDEN;
   const size_t mark = jt_work_mark(c);
   float *x_out = jt_work_alloc(c, stride);                       // the recompute's output; nothing reads it

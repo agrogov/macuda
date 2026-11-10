@@ -74,6 +74,7 @@ typedef struct {
   double lr, readout_lr;   // design §2.2's two lr groups
   double weight_cap;
   int epochs, batch, accum, eval_every, max_steps, log_every, eval_only;
+  int no_recompute;        // --no-recompute: keep every layer's forward saves instead of recomputing them (plan M8 item 4)
 } Args;
 
 // src/model.c's design §6.2 backward driver. Declared here, not in src/model.h (another task's frozen file): the dumps
@@ -113,6 +114,8 @@ static void usage(FILE *f) {
           "  --max-steps N           stop after N optimizer steps (0, the default: the whole schedule)\n"
           "  --eval-temperature T    temperature for the written probabilities: a number, or 'checkpoint'\n"
           "  --eval-only             score the --eval splits, do not train\n"
+          "  --no-recompute          keep every layer's forward saves instead of recomputing them in the backward: one\n"
+          "                          forward less per step (plan M8 item 4) at about 3.2 MB per packed token\n"
           "  --init-adapter DIR      load a Python-written adapter over the checkpoint's readout\n"
           "  --targets soft|hard     recorded in report.json/adapter_config.json; default soft\n"
           "  --weights none|balanced   recorded likewise; default none\n"
@@ -225,6 +228,8 @@ static void parse_args(int argc, char **argv, Args *a) {
       a->log_every = int_arg(opt, val, 1, 1000000), k++;
     } else if (strcmp(opt, "--eval-only") == 0) {
       a->eval_only = 1;
+    } else if (strcmp(opt, "--no-recompute") == 0) {
+      a->no_recompute = 1;
     } else {
       die("unknown or incomplete option '%s' (--help for the usage)", opt);
     }
@@ -1644,6 +1649,28 @@ int main(int argc, char **argv) {
   }
   if (a.targets == NULL) a.targets = "soft";
   if (a.weights == NULL) a.weights = "none";
+
+  // --no-recompute (plan M8 item 4) is a training flag: it keeps every layer's forward saves for the backward, so a
+  // forward-only run (--eval-only, --dump-forward) neither allocates the store nor takes the SAVE path. src/model.c reads
+  // the mode from the environment, as JT_EXACT and JT_GDN_CHUNKED are, so the re-gate scripts can switch it on without a
+  // flag — and it needs one number only this file has: the token count to size the store for, which is the train split's
+  // widest batch, because the context's cap_tokens is usually a dev check's (train.py's dev batches are twice the training
+  // batch) and a dev check has no backward to feed. A batch above the hint takes the recompute path in both sweeps
+  // (src/model.c's store_serves), so the hint is a size, never a correctness switch: set it whether or not the mode is on,
+  // so a run started with JT_NO_RECOMPUTE=1 in the environment is sized exactly like one started with the flag.
+  if (train_s.j != NULL) { // --dump-backward's single batch is the whole context there, so it needs no hint
+    char tok[32];
+    snprintf(tok, sizeof tok, "%u", jtb_max_tokens_per_batch(train_s.j));
+    if (setenv("JT_NO_RECOMPUTE_TOKENS", tok, 1) != 0) die("setenv: %s", strerror(errno));
+  }
+  if (a.no_recompute) {
+    if (a.eval_only || a.dump_fwd != NULL) {
+      printf("jefftrain: --no-recompute has no effect here (no backward in this run)\n");
+      fflush(stdout);
+    } else if (setenv("JT_NO_RECOMPUTE", "1", 1) != 0) {
+      die("setenv: %s", strerror(errno));
+    }
+  }
 
   // ---- the model ------------------------------------------------------------------------------------------------------
   gemm_init(); // prints "gemm: exact fp32" or "gemm: tf32" once, before anything allocates (design §5)
