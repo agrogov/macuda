@@ -16,6 +16,7 @@
 
 #include "util.h"
 #include "gemm.h"
+#include "harness.h" // test/harness.h's jt_f32_to_bf16: the tree's one fp32 -> bf16 rule (the kernel in kernels/misc.cu, the reference in ref/misc.c)
 
 #define TOL_EXACT 1e-5
 #define TOL_TF32 5e-3
@@ -80,8 +81,10 @@ static void ref_gemm(int M, int N, int K, double alpha, const float *A, const fl
   free(acc);
 }
 
-// rel = max|got-want| / max(1e-30, max|want|); a non-finite result is a failure, never a small error.
-static double rel_err(const float *got, const double *want, long n) {
+// rel = max|got-want| / max(1e-30, max|want|); a non-finite result is a failure, never a small error. (Named
+// rel_vs_double, not rel_err: test/harness.h's rel_err is a macro over a `real` reference, and this file compares
+// against `double` ones. Same formula.)
+static double rel_vs_double(const float *got, const double *want, long n) {
   double maxd = 0.0, maxw = 0.0;
   for (long i = 0; i < n; i++) {
     const double d = fabs((double)got[i] - want[i]);
@@ -135,7 +138,7 @@ static void check_gemm(cublasHandle_t h, int ta, int tb, int M, int N, int K, fl
     for (long i = 0; i < nc; i++) cin[i] = (double)c[i];
     ref_gemm(M, N, K, (double)alpha, ap, bp, (double)beta, cin, want);
     CK(cudaMemcpy(c, dc, (size_t)nc * sizeof *c, cudaMemcpyDeviceToHost));
-    rel = rel_err(c, want, nc);
+    rel = rel_vs_double(c, want, nc);
     free(ap);
     free(bp);
     free(cin);
@@ -191,7 +194,7 @@ static void check_batched(cublasHandle_t h, int ta, int tb, int M, int N, int K,
       ref_gemm(M, N, K, (double)alpha, ap, bp, (double)beta, cin, want + (long)j * sC);
     }
     CK(cudaMemcpy(c, dc, (size_t)(nc * batch) * sizeof *c, cudaMemcpyDeviceToHost));
-    rel = rel_err(c, want, nc * batch);
+    rel = rel_vs_double(c, want, nc * batch);
     free(ap);
     free(bp);
     free(cin);
@@ -210,6 +213,119 @@ static void check_batched(cublasHandle_t h, int ta, int tb, int M, int N, int K,
   free(a);
   free(b);
   free(c);
+}
+
+// ---- bf16 operands (plan M8.1b) ---------------------------------------------------------------------------------------
+// The frozen-weight GEMM with both operands bf16 and fp32 output. The CPU reference is computed from the *bf16-rounded*
+// inputs — the same rounding the kernel implements, via test/harness.h's jt_f32_to_bf16 — so the case fails if the cast,
+// the operand dtypes, the transpose or the fp32 accumulate is wrong, and a wrong cast cannot hide behind the storage's own
+// rounding.
+//
+// Two shapes: the forward's real one (M = 4,200 packed tokens, N = 3,584 = the MLP width, K = 1,024 = the hidden size,
+// tb = 1 because a checkpoint weight is stored [out][in]) and a small one whose token count is not a multiple of 8 — the
+// rule is about the row lengths (K and N here), not the batch.
+static void check_bf16(cublasHandle_t h, int M, int N, int K, float alpha, float beta) {
+  const long na = (long)M * K, nb = (long)N * K, nc = (long)M * N;
+  float *a = xmalloc((size_t)na * sizeof *a);
+  float *b = xmalloc((size_t)nb * sizeof *b);
+  float *c = xmalloc((size_t)nc * sizeof *c);
+  unsigned short *ab = xmalloc((size_t)na * sizeof *ab); // the operands as the device sees them: bf16 bits
+  unsigned short *bb = xmalloc((size_t)nb * sizeof *bb);
+  for (long i = 0; i < na; i++) a[i] = frand();
+  for (long i = 0; i < nb; i++) b[i] = frand();
+  for (long i = 0; i < nc; i++) c[i] = frand();
+  for (long i = 0; i < na; i++) ab[i] = jt_f32_to_bf16(a[i]);
+  for (long i = 0; i < nb; i++) bb[i] = jt_f32_to_bf16(b[i]);
+
+  unsigned short *da = NULL, *db = NULL;
+  float *dc = NULL;
+  CK(cudaMalloc((void **)&da, (size_t)na * sizeof *da));
+  CK(cudaMalloc((void **)&db, (size_t)nb * sizeof *db));
+  CK(cudaMalloc((void **)&dc, (size_t)nc * sizeof *dc));
+  CK(cudaMemcpy(da, ab, (size_t)na * sizeof *ab, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(db, bb, (size_t)nb * sizeof *bb, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(dc, c, (size_t)nc * sizeof *c, cudaMemcpyHostToDevice));
+
+  const int ok = gemm_bf16_ok(0, 1, M, N, K, da, db);
+  gemm_bf16(h, 0, 1, M, N, K, alpha, da, db, beta, dc); // y = x W^T, the forward's shape (tb = 1)
+
+  double rel = 0.0;
+  if (verifying) {
+    float *aw = xmalloc((size_t)na * sizeof *aw); // the bf16 inputs widened back to fp32: exact, bf16 -> fp32 is `bits << 16`
+    float *bw = xmalloc((size_t)nb * sizeof *bw);
+    float *bp = xmalloc((size_t)nb * sizeof *bp);
+    double *cin = xmalloc((size_t)nc * sizeof *cin);
+    double *want = xmalloc((size_t)nc * sizeof *want);
+    for (long i = 0; i < na; i++) {
+      const unsigned int u = (unsigned int)ab[i] << 16;
+      memcpy(&aw[i], &u, sizeof aw[i]);
+    }
+    for (long i = 0; i < nb; i++) {
+      const unsigned int u = (unsigned int)bb[i] << 16;
+      memcpy(&bw[i], &u, sizeof bw[i]);
+    }
+    for (long i = 0; i < nc; i++) cin[i] = (double)c[i];
+    // the reference's B is always the contiguous [K,N]; ours is stored [N,K] because tb = 1 (the same prep_b the fp32
+    // cases use, so a transposed call cannot agree with it by accident).
+    prep_b(bw, 1, K, N, bp);
+    ref_gemm(M, N, K, (double)alpha, aw, bp, (double)beta, cin, want);
+    CK(cudaMemcpy(c, dc, (size_t)nc * sizeof *c, cudaMemcpyDeviceToHost));
+    rel = rel_vs_double(c, want, nc);
+    free(aw);
+    free(bw);
+    free(bp);
+    free(cin);
+    free(want);
+  }
+
+  CK(cudaFree(da));
+  CK(cudaFree(db));
+  CK(cudaFree(dc));
+  if (verifying) {
+    char name[96];
+    snprintf(name, sizeof name, "bf16 M=%d N=%d K=%d alpha=%g beta=%g", M, N, K, (double)alpha, (double)beta);
+    report(name, ok ? rel : INFINITY); // a shape design §6.1's rule does not qualify is a failure here, not a fallback
+  }
+  free(a);
+  free(b);
+  free(c);
+  free(ab);
+  free(bb);
+}
+
+// design §6.1's alignment rule as gemm_bf16_ok() states it: each operand's leading dimension (its row length, which is
+// also the extent its kernel walks contiguously) is a multiple of 8 elements and both bases are 16-byte aligned.
+static void check_bf16_ok(void) {
+  static const struct {
+    int ta, tb, M, N, K, want;
+    const char *what;
+  } cases[] = {
+      {0, 1, 4200, 3584, 1024, 1, "the MLP gate shape: ld 1024/1024"},
+      {0, 0, 4200, 1024, 3584, 1, "dx = dy W: ld 1024/3584"},
+      {0, 1, 37, 48, 64, 1, "ragged tokens, ld 64/64"},
+      {0, 1, 37, 13, 64, 1, "N=13 is fine: the rule is the row length"},
+      {0, 1, 37, 64, 60, 0, "K=60 is not a multiple of 8"},
+      {1, 0, 12, 64, 64, 0, "M=12 with ta=1: its row length is 12"},
+      {1, 0, 7, 13, 5, 0, "the degenerate shape: 5 and 7"},
+      {0, 0, 0, 8, 8, 0, "M=0 is not a GEMM"},
+  };
+  float *a = NULL, *b = NULL;
+  CK(cudaMalloc((void **)&a, 4096 * sizeof *a));
+  CK(cudaMalloc((void **)&b, 4096 * sizeof *b));
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+    const int got = gemm_bf16_ok(cases[i].ta, cases[i].tb, cases[i].M, cases[i].N, cases[i].K, a, b);
+    const int ok = got == cases[i].want;
+    printf("  %-52s ok=%d (want %d)  %s\n", cases[i].what, got, cases[i].want, ok ? "ok" : "FAIL");
+    if (!ok) nfail++;
+    ncase++;
+  }
+  // a base that is only 4-byte aligned (an fp32 element, not the 8 bf16 elements the fast path needs) is refused too
+  const int mis = gemm_bf16_ok(0, 1, 8, 64, 64, (const char *)a + 4, b);
+  printf("  %-52s ok=%d (want 0)  %s\n", "a base that is only 4-byte aligned", mis, mis == 0 ? "ok" : "FAIL");
+  if (mis != 0) nfail++;
+  ncase++;
+  CK(cudaFree(a));
+  CK(cudaFree(b));
 }
 
 int main(void) {
@@ -248,6 +364,15 @@ int main(void) {
     check_batched(h, 0, 1, L, L, 256, 8, 1.0f, 0.0f);
     check_batched(h, 0, 0, L, 256, L, 8, 1.0f, 0.0f);
   }
+
+  // plan M8.1b: the frozen-weight GEMMs with bf16 operands, against the same reference on bf16-rounded inputs, plus the
+  // qualification rule that decides whether a shape may use them at all.
+  check_bf16_ok();
+  for (size_t i = 0; i < sizeof alphas / sizeof alphas[0]; i++)
+    for (size_t j = 0; j < sizeof betas / sizeof betas[0]; j++) {
+      check_bf16(h, 4200, 3584, 1024, alphas[i], betas[j]);
+      check_bf16(h, 37, 48, 64, alphas[i], betas[j]);
+    }
 
   CB(cublasDestroy(h));
 

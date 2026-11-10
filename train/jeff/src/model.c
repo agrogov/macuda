@@ -22,6 +22,11 @@
 // layer's saves in a "store" appended to the arena, so the backward reads them where the forward left them and re-runs
 // nothing — one forward less per step, at 3.2 MB of device memory per packed token. The section before jt_ctx_alloc has
 // the layout and the reasons.
+//
+// Plan M8.1b (JT_BF16_WEIGHTS=1) is the third memory story here: the frozen Linear weights stay bf16 in a second arena
+// instead of being widened into the fp32 one, which halves them (1.99 -> 1.00 GB) and gives their GEMMs bf16 operands.
+// It changes no layer, no kernel and no arithmetic outside those two GEMMs; model_load's walk places each tensor in one
+// arena or the other, and exact mode refuses the toggle so M6.2's exact trace cannot move.
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
@@ -34,6 +39,8 @@
 #include "layer.h"
 #include "st.h"
 #include "util.h"
+
+#include "gemm.h" // src/gemm.h: gemm_is_exact, so exact mode can ignore M8.1b's bf16 weights everywhere
 
 #include "gdn.h"  // kernels/gdn.h: the checkpoint and backward-scratch size helpers
 #include "misc.h" // kernels/misc.h: jt_bf16_to_f32_n, jt_embed_gather
@@ -99,7 +106,9 @@ typedef struct {
   const Lora *lora;      // for the A/B offsets of the adapted linears
   St *st;
   int pass;              // 0 = size and check, 1 = widen
+  int bf16;              // 1 = the frozen Linear weights stay bf16, in m->wb (plan M8.1b)
   size_t at;             // floats placed so far
+  size_t atb;            // bf16 elements placed so far
   size_t ntensor;        // tensors checked with st_get
   size_t max_el;         // the largest tensor's element count (sizes the staging buffer)
   size_t embed_el;       // the embedding table's element count
@@ -150,6 +159,30 @@ static float *put(Loader *L, const char *name, int ndim, const int *shape) {
   return dst;
 }
 
+// One bf16 checkpoint tensor kept as bf16 (plan M8.1b): the checkpoint's own bits, copied straight from the host mapping
+// into the bf16 arena, so this path needs neither the staging buffer nor the widening kernel — and loses nothing, because
+// every frozen tensor in the checkpoint is already BF16 (the load's listing is in notes/J47.md). Slots are rounded up to
+// 8 elements (16 bytes) so that design §6.1's alignment rule holds for every operand base, not just by luck of the
+// tensor sizes; the arena itself comes from cudaMalloc and is 256-byte aligned.
+static unsigned short *reserve_bf16(Loader *L, size_t n) {
+  L->atb = (L->atb + 7u) & ~(size_t)7u;
+  unsigned short *p = L->pass ? L->m->wb + L->atb : NULL;
+  L->atb += n;
+  return p;
+}
+
+static unsigned short *put_bf16(Loader *L, const char *name, int ndim, const int *shape) {
+  const void *src = st_getv(L->st, name, ST_DTYPE_BF16, ndim, shape);
+  size_t n = 1;
+  for (int i = 0; i < ndim; i++) n *= (size_t)shape[i];
+  unsigned short *dst = reserve_bf16(L, n);
+  if (L->pass) {
+    CK(cudaMemcpy(dst, src, n * sizeof(unsigned short), cudaMemcpyHostToDevice));
+    L->ntensor++;
+  }
+  return dst;
+}
+
 // A_log [16] and dt_bias [16] as fp32, plus negA = -exp(A_log) (plan M4.2). The exp is the host's, in double, once.
 static void put_gates(Loader *L, const MtLayer *ml, LayerWeights *lw) {
   const int shape[1] = {MT_GDN_HEADS};
@@ -173,13 +206,17 @@ static void put_gates(Loader *L, const MtLayer *ml, LayerWeights *lw) {
   if (L->pass) L->ntensor += 2;
 }
 
-// One [out,in] checkpoint matrix and the Linear that reads it. The structural fields (in/out/lora/W/stem, and the A/B
-// offsets found by adapter key in src/lora.c's table) are pass 1's; pass 0 only places and counts the tensor.
+// One [out,in] checkpoint matrix and the Linear that reads it. The structural fields (in/out/lora/W/Wb/stem, and the A/B
+// offsets found by adapter key in src/lora.c's table) are pass 1's; pass 0 only places and counts the tensor. With
+// plan M8.1b's bf16 storage the matrix goes to the bf16 arena and `W` gets the shared marker pointer (src/linear.h):
+// eight zeroed words, not this linear's weight, so a "is it loaded?" check that only tests W for NULL still passes.
 static void put_linear(Loader *L, const MtLinear *t, Linear *out) {
   const int shape[2] = {t->out, t->in};
-  float *W = put(L, t->name, 2, shape);
+  float *W = L->bf16 ? NULL : put(L, t->name, 2, shape);
+  unsigned short *Wb = L->bf16 ? put_bf16(L, t->name, 2, shape) : NULL;
   if (!L->pass) return;
-  out->W = W;
+  out->W = L->bf16 ? L->m->w_mark : W;
+  out->Wb = Wb;
   out->in = t->in;
   out->out = t->out;
   out->lora = (t->lora == MT_LORA);
@@ -261,9 +298,29 @@ static void load_readout(Model *m, const char *path, unsigned short *stage, size
   st_close(st);
 }
 
+// Plan M8.1b's switch, in the environment as JT_EXACT and JT_NO_RECOMPUTE are: JT_BF16_WEIGHTS unset (or "0") is the
+// fp32 storage, byte for byte what this file did before; any other value keeps the frozen Linear weights bf16 and runs
+// their GEMMs with bf16 operands (src/linear.c's weight_gemm).
+//
+// Exact mode ignores it, and says so: every activation and gradient gate (design §10.2, plan M6.2) is measured in exact
+// mode, and the reason that mode is bit-reproducible is that it never changes — a bf16 weight GEMM would round the
+// weights' 8-bit mantissas against nothing and move M6.2's trace. So JT_EXACT=1 JT_BF16_WEIGHTS=1 is the fp32 storage
+// plus one line saying the toggle was seen and dropped, which is what `ab.sh --same --env-b JT_BF16_WEIGHTS=1` reads.
+static int bf16_weights_toggle(void) {
+  const char *s = getenv("JT_BF16_WEIGHTS");
+  if (s == NULL || s[0] == '\0' || strcmp(s, "0") == 0) return 0;
+  if (gemm_is_exact()) {
+    printf("weights: bf16 ignored (JT_EXACT=1: exact mode keeps the fp32 path byte for byte)\n");
+    fflush(stdout);
+    return 0;
+  }
+  return 1;
+}
+
 Model *model_load(const char *path, Lora *lora) {
   if (path == NULL || path[0] == '\0') die("model_load: no checkpoint path");
   if (lora == NULL) die("model_load: the readout lives in the flat parameter buffer, so a Lora is required");
+  const int bf16 = bf16_weights_toggle(); // before the walk: it decides which arena a Linear's weight goes to
   Model *m = (Model *)calloc(1, sizeof *m);
   if (m == NULL) die("out of memory (Model)");
   m->lora = lora;
@@ -279,26 +336,43 @@ Model *model_load(const char *path, Lora *lora) {
   L.m = m;
   L.lora = lora;
   L.st = st_open(path);
+  L.bf16 = bf16;
   L.pool_cap = MODEL_STEM_POOL;
   L.pool = (char *)malloc(L.pool_cap);
   if (L.pool == NULL) die("out of memory (stem pool)");
 
   model_walk(&L); // pass 0: every shape checked, the arena sized
   if (L.at == 0 || L.max_el == 0 || L.embed_el == 0) die("nothing to load in %s", path);
+  if (bf16 && L.atb == 0) die("JT_BF16_WEIGHTS: the bf16 arena would be empty, the model table has no linear");
   const size_t w_floats = L.at;
-  CK(cudaMalloc((void **)&m->w, w_floats * sizeof(float)));
+  const size_t wb_el = L.atb;
+  // The staging buffer holds the largest tensor this load copies through it: a model tensor, or the readout, which lives
+  // in its own file and is checked after the walk (with bf16 weights no model tensor is that big any more — the frozen
+  // linears no longer go through `put` — so the readout's size is the one that decides).
+  const size_t readout_el = (size_t)MT_READOUT_OUT * (size_t)MT_READOUT_IN;
+  const size_t stage_el = L.max_el > readout_el ? L.max_el : readout_el;
+  CK(cudaMalloc((void **)&m->w, (w_floats + (bf16 ? 8u : 0u)) * sizeof(float)));
+  if (bf16) {
+    float *mark = m->w + w_floats; // + 8 words above the arena: the bf16 linears' presence marker (src/linear.h)
+    CK(cudaMemset(mark, 0, 8 * sizeof(float)));
+    m->w_mark = mark;
+  }
+  if (bf16) CK(cudaMalloc((void **)&m->wb, wb_el * sizeof(unsigned short)));
   CK(cudaMalloc((void **)&m->embed, L.embed_el * sizeof(unsigned short)));
   unsigned short *stage = NULL;
-  CK(cudaMalloc((void **)&stage, L.max_el * sizeof(unsigned short)));
+  CK(cudaMalloc((void **)&stage, stage_el * sizeof(unsigned short)));
 
   L.pass = 1;
   L.at = 0;
+  L.atb = 0;
   L.stage = stage;
-  L.stage_el = L.max_el;
-  model_walk(&L); // pass 1: widen every tensor into the arena
+  L.stage_el = stage_el;
+  model_walk(&L); // pass 1: widen (or copy bf16) every tensor into its arena
   if (L.at != w_floats) die("the sizing pass and the load pass disagree (%zu vs %zu floats)", w_floats, L.at);
+  if (L.atb != wb_el) die("the sizing pass and the load pass disagree (%zu vs %zu bf16 elements)", wb_el, L.atb);
   m->w_floats = w_floats;
-  load_readout(m, path, stage, L.max_el);
+  m->wb_el = wb_el;
+  load_readout(m, path, stage, stage_el);
   const size_t ntensor = L.ntensor + 1; // + the readout, which is st_get-checked in its own file
 
   CK(cudaFree(stage));
@@ -306,8 +380,16 @@ Model *model_load(const char *path, Lora *lora) {
   CK(cudaDeviceSynchronize()); // the load ran on the null stream; the layers run on ctx->stream (a non-blocking one)
   free(L.pool);
 
-  printf("model: %d layers (%d gdn, %d attn), weights %.2f GB fp32 + embed %.2f GB bf16\n", MT_LAYERS, m->n_gdn, m->n_full,
-         (double)w_floats * sizeof(float) / 1e9, (double)m->embed_el * sizeof(unsigned short) / 1e9);
+  if (bf16) {
+    printf("model: %d layers (%d gdn, %d attn), weights %.2f GB bf16 + %.2f GB fp32 + embed %.2f GB bf16\n", MT_LAYERS,
+           m->n_gdn, m->n_full, (double)wb_el * sizeof(unsigned short) / 1e9,
+           (double)w_floats * sizeof(float) / 1e9, (double)m->embed_el * sizeof(unsigned short) / 1e9);
+    printf("weights: bf16 (%.2f GB)\n",
+           ((double)wb_el * sizeof(unsigned short) + (double)w_floats * sizeof(float)) / 1e9);
+  } else {
+    printf("model: %d layers (%d gdn, %d attn), weights %.2f GB fp32 + embed %.2f GB bf16\n", MT_LAYERS, m->n_gdn,
+           m->n_full, (double)w_floats * sizeof(float) / 1e9, (double)m->embed_el * sizeof(unsigned short) / 1e9);
+  }
   printf("model: %zu frozen tensors checked by st_get (dtype and every dimension), readout %.2f MB fp32 in the flat buffer\n",
          ntensor, (double)((size_t)MT_READOUT_OUT * MT_READOUT_IN * sizeof(float)) / 1e6);
   fflush(stdout);
@@ -316,6 +398,7 @@ Model *model_load(const char *path, Lora *lora) {
 
 void model_free(Model *m) {
   if (m == NULL) return;
+  if (m->wb != NULL) CK(cudaFree(m->wb));
   if (m->w != NULL) CK(cudaFree(m->w));
   if (m->embed != NULL) CK(cudaFree(m->embed));
   free(m);

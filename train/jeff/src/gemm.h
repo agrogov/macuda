@@ -30,4 +30,23 @@ void gemm(cublasHandle_t h, int ta, int tb, int M, int N, int K, float alpha,
 void gemm_batched(cublasHandle_t h, int ta, int tb, int M, int N, int K, float alpha,
                   const float *A, long sA, const float *B, long sB, float beta, float *C, long sC, int batch);
 
+// ---- bf16 operands, fp32 output (plan M8.1b, design §6.1's alignment rules) -------------------------------------------
+// The same row-major GEMM with A and B stored as bf16 and C fp32, through cublasGemmEx's CUDA_R_16BF operands and
+// CUBLAS_COMPUTE_32F (fp32 accumulate). cuBLAS runs a GEMM only when both operands are one type, so a bf16 weight can
+// only meet a bf16 activation — that is why the frozen-weight path casts the activation (kernels/misc.h's
+// jt_f32_to_bf16_n) instead of leaving it fp32.
+//
+// Design §6.1's alignment rule, as libtinycublas states it (cublas.c:145): the contiguous extent and the leading
+// dimension of each operand must be multiples of 8 elements and both bases 16-byte aligned. A shape outside that rule
+// has no bf16 kernel on the shim (NOT_SUPPORTED) and is not the fast path on real cuBLAS either, so gemm_bf16_ok()
+// answers the question first and the caller keeps the fp32 path when it says no. `A` is [M,K] / `B` is [K,N] (or their
+// transposes, as ta/tb say — the same convention as gemm()), both bf16 as `unsigned short` (the tree's bf16 type).
+int gemm_bf16_ok(int ta, int tb, int M, int N, int K, const void *A, const void *B);
+
+// The bf16 GEMM itself. Precondition: gemm_bf16_ok() returned 1 for these shapes and pointers; it re-checks and stops
+// with the numbers instead of handing cuBLAS a shape its bf16 kernels do not serve. Only gemm()'s non-batched form is
+// mirrored here: the two frozen-weight GEMMs are the ones M8.1b changes, and neither is batched.
+void gemm_bf16(cublasHandle_t h, int ta, int tb, int M, int N, int K, float alpha, const unsigned short *A,
+               const unsigned short *B, float beta, float *C);
+
 #endif // JT_GEMM_H

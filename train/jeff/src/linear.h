@@ -19,6 +19,15 @@
 // y [n,out], dy [n,out], dx [n,in]. The frozen weights are the checkpoint's bf16 widened once at load (design §6.1), so
 // the backward uses the same W pointer the forward did and no W^T is ever stored (design §5).
 //
+// Two frozen-weight storages (plan M8.1b). By default a Linear carries `W`, fp32 [out][in], exactly as above. With
+// JT_BF16_WEIGHTS=1 (and only outside exact mode — model.c refuses it under JT_EXACT) the model instead keeps the
+// weight bf16 in `Wb`, the checkpoint's own bits, and allocates no fp32 copy: 1.99 GB of frozen weights become 1.00 GB.
+// `Wb != NULL` is then the whole test, and a linear that carries `Wb` also has `W` set to a pointer that is **not a
+// weight**: eight zeroed fp32 words shared by every such linear (src/model.h's `w_mark`), so a caller that only asks
+// "is this linear loaded?" (src/layer_mlp.c's `W == NULL` argument check) still sees a loaded one. Read a weight from
+// `Wb` when it is set, and never dereference `W` then. The LoRA factors, the readout and everything trainable stay
+// fp32 in both storages (design §6.1).
+//
 // dA and dB are *accumulated* into ctx->lora->grad (design §4.2, §8.1): a gradient belongs to the step, not to the
 // layer, and an accumulation group sums several batches into it. A frozen linear (lora == 0, e.g. the GDN in_proj_a /
 // in_proj_b, which design §2.1 does not adapt) writes no parameter gradient at all.
@@ -46,13 +55,14 @@ enum {
 
 // One linear of the model. Model.c fills these from src/model_table.h at load; a layer never builds one by hand.
 typedef struct Linear {
-  const float *W;    // [out][in] fp32 device, frozen (widened from the checkpoint's bf16 at load)
-  int in;            // columns of x / of W's rows
-  int out;           // columns of y
-  int lora;          // 1 = adapted (A and B live in the flat parameter buffer), 0 = frozen
-  size_t a_off;      // element offset of A [rank][in] in ctx->lora->param; 0 when lora == 0
-  size_t b_off;      // element offset of B [out][rank]; 0 when lora == 0
-  const char *stem;  // the adapter key prefix, `{stem}.lora_A` / `{stem}.lora_B` (design §9.2); for messages and tests
+  const float *W;           // [out][in] fp32 device, frozen (widened from the checkpoint's bf16 at load)
+  const unsigned short *Wb; // [out][in] bf16 device: the frozen weight when the model keeps bf16 (see below)
+  int in;                   // columns of x / of W's rows
+  int out;                  // columns of y
+  int lora;                 // 1 = adapted (A and B live in the flat parameter buffer), 0 = frozen
+  size_t a_off;             // element offset of A [rank][in] in ctx->lora->param; 0 when lora == 0
+  size_t b_off;             // element offset of B [out][rank]; 0 when lora == 0
+  const char *stem;         // the adapter key prefix, `{stem}.lora_A` / `{stem}.lora_B` (design §9.2); for messages and tests
 } Linear;
 
 // y = x W^T (+ s (x A^T) B^T). x [n,in], y [n,out]; both are written in full and may not alias. u_save, when not

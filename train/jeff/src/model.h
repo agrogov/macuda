@@ -11,6 +11,12 @@
 // uses are ever wanted and design §8.1's jt_embed_gather widens those. The trainable parameters are not here at all: the
 // LoRA factors and the readout live in src/lora.c's flat buffer, and a Linear only carries their offsets.
 //
+// plan M8.1b's `JT_BF16_WEIGHTS=1` adds a second storage: the frozen *Linear* weights (the 0.5 B parameters of the two
+// weight GEMMs) are then kept as bf16 in `wb`, the checkpoint's own bits, and no fp32 copy of them is allocated — the
+// fp32 arena shrinks to the norms, the conv taps and the gate vectors, about 2 MB. The embedding table is bf16 in both
+// storages, so the whole frozen set goes 1.99 + 0.51 GB -> 1.00 + 0.51 GB (the load prints `weights: bf16 (x GB)`).
+// Exact mode ignores the toggle (src/model.c): M6.2's trace is bit-identical only because the exact path never changes.
+//
 // Nothing is random and nothing is a guess: st_get checks the dtype and every dimension of every tensor it is asked for
 // (src/st.h), so a checkpoint with a different layout fails at load, naming the tensor and both shapes.
 #ifndef JT_MODEL_H
@@ -51,8 +57,11 @@ typedef struct {
 
 // The model. Every pointer is device memory owned by the Model (or, for the readout, by the borrowed Lora).
 typedef struct Model {
-  float *w;                 // the fp32 arena of frozen weights (design §6.1)
+  float *w;                 // the fp32 arena of frozen weights (design §6.1): everything but the bf16 linears' weights
   size_t w_floats;          // its size, in floats (the load prints it as GB)
+  unsigned short *wb;       // the bf16 arena of frozen Linear weights (plan M8.1b); NULL in the fp32 storage
+  size_t wb_el;             // its size, in bf16 elements (the load prints it as GB)
+  const float *w_mark;      // 8 zeroed fp32 words: what every bf16 linear's Linear.W points at (src/linear.h)
   unsigned short *embed;    // [MT_VOCAB][MT_HIDDEN] bf16, never widened (design §8.1's jt_embed_gather)
   size_t embed_el;
   const float *final_norm;  // [MT_HIDDEN], zero-centred
@@ -68,6 +77,10 @@ typedef struct Model {
 // what train.py's --init-adapter does. Prints, in this order:
 //   model: 24 layers (18 gdn, 6 attn), weights 1.99 GB fp32 + embed 0.51 GB bf16
 //   model: 321 frozen tensors checked by st_get (dtype and every dimension), readout 1.04 MB fp32 in the flat buffer
+// with JT_BF16_WEIGHTS=1 (and not in exact mode) the first line splits the two storages and one more line follows:
+//   model: 24 layers (18 gdn, 6 attn), weights 1.00 GB bf16 + 0.00 GB fp32 + embed 0.51 GB bf16
+//   weights: bf16 (1.00 GB)
+// and in exact mode with the toggle set, where the fp32 storage is kept, `weights: bf16 ignored (...)` says so.
 // Dies with a message naming the tensor, its shape and the expected one if anything disagrees.
 Model *model_load(const char *path, Lora *lora);
 void model_free(Model *m);
