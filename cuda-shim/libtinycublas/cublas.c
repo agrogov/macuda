@@ -132,6 +132,19 @@ static int gemm_contract(cudaDataType At, cudaDataType Bt, cudaDataType Ct, cubl
   if (*in == 1) return c32 || (c16 && *out == 1) ? 0 : -1;
   return c32 ? 0 : -1;
 }
+// WHICH KERNEL AN f32 GEMM TAKES, and why the compute type has to decide (G-m8probe finding 1, 2026-11-11). This used to
+// be the tensor-core TF32 kernel for every f32 GEMM, which is right for ggml - it sets CUBLAS_TF32_TENSOR_OP_MATH on its
+// handles (ggml-cuda common.cuh:1544 at 945e0af) and gets the tensor-core path it asks for - and wrong for a caller that
+// says CUBLAS_COMPUTE_32F because it needs the 24-bit mantissa: jt's gemm.c documents "COMPUTE_32F on the plain fp32"
+// (src/gemm.c, the JT_EXACT path) and GDN's chunked recurrence asks for it by hand precisely because TF32's ~5e-4 cannot
+// meet its 1e-4 gate (kernels/gdn.cu, notes/J37.md). Running TF32 anyway put 6.1e-4-6.6e-4 into that cross-check on the
+// card while gpubox, on real cuBLAS, measured 1e-6. So: a *FAST_* compute type asks for tensor cores, COMPUTE_32F asks for
+// exact fp32 unless the handle's math mode has TF32 on, which is exactly cuBLAS's own rule.
+// bf16 has no exact/tf32 pair (its operands are 8-bit mantissa already), so this only gates f32 input.
+static int f32_tf32(const struct tinyblas_handle* h, cublasComputeType_t ct){
+  if (ct==CUBLAS_COMPUTE_32F_FAST_TF32 || ct==CUBLAS_COMPUTE_32F_FAST_16F || ct==CUBLAS_COMPUTE_32F_FAST_16BF) return 1;
+  return h != NULL && h->math_mode == (int)CUBLAS_TF32_TENSOR_OP_MATH;
+}
 
 // One launch for a whole strided batch on the tensor cores: grid (m/64, n/64, batch), 128 threads. Strides are in elements
 // of the respective dtype, as cuBLAS defines them; gridDim.z is capped at 65535 so a larger batch goes in chunks.
@@ -214,8 +227,13 @@ static cublasStatus_t launch_gemm_tc(struct tinyblas_handle* h, cublasOperation_
 }
 
 static cublasStatus_t launch_gemm(struct tinyblas_handle* h, cublasOperation_t opA, cublasOperation_t opB,
-    int m,int n,int k, float alpha, const void*A,int lda, const void*B,int ldb, float beta, void*C,int ldc, int in_dtype, int out_dtype){
-  if ((in_dtype==1 || in_dtype==0) && tc_enabled() && (in_dtype==0 ? tinycublas_gemm_tf32_kernel() : tinycublas_gemm_tc_kernel()))
+    int m,int n,int k, float alpha, const void*A,int lda, const void*B,int ldb, float beta, void*C,int ldc, int in_dtype, int out_dtype, int tf32){
+  // f32 takes the TF32 tensor-core kernel only when the compute type or the handle's math mode asked for it (f32_tf32);
+  // otherwise it falls through to the scalar kernel below, whose fp32 accumulation is the exact answer. f16 has no
+  // exact/TF32 pair: its operand mantissa is already below TF32's, so the tensor cores are the faithful path there.
+  if (in_dtype==1 && tc_enabled() && tinycublas_gemm_tc_kernel())
+    return launch_gemm_tc(h, opA,opB, m,n,k, alpha, A,lda,0, B,ldb,0, beta, C,ldc,0, 1, in_dtype, out_dtype);
+  if (in_dtype==0 && tf32 && tc_enabled() && tinycublas_gemm_tf32_kernel())
     return launch_gemm_tc(h, opA,opB, m,n,k, alpha, A,lda,0, B,ldb,0, beta, C,ldc,0, 1, in_dtype, out_dtype);
   // bf16 (2026-09-21): the vectorised tensor-core kernels when the shape allows them, as f16 does; the scalar kernel
   // below only for a shape they refuse. This used to take the scalar kernel always, which held a bf16 Qwen2.5-3B prompt
@@ -249,13 +267,16 @@ cublasStatus_t cublasSetStream_v2(cublasHandle_t h, cudaStream_t s){ ((struct ti
 cublasStatus_t cublasSetMathMode(cublasHandle_t h, cublasMath_t m){ ((struct tinyblas_handle*)h)->math_mode=(int)m; return CUBLAS_STATUS_SUCCESS; }
 cublasStatus_t cublasSgemm_v2(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,int n,int k,
     const float* alpha, const float* A,int lda, const float* B,int ldb, const float* beta, float* C,int ldc){
-  return launch_gemm((struct tinyblas_handle*)h, ta,tb, m,n,k, *alpha,A,lda,B,ldb,*beta,C,ldc, 0, 0);
+  // cublasSgemm has no compute type: cuBLAS follows the handle's math mode for TF32, as here.
+  return launch_gemm((struct tinyblas_handle*)h, ta,tb, m,n,k, *alpha,A,lda,B,ldb,*beta,C,ldc, 0, 0,
+                     f32_tf32((struct tinyblas_handle*)h, CUBLAS_COMPUTE_32F));
 }
 cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,int n,int k,
     const void* alpha, const void* A, cudaDataType Atype,int lda, const void* B, cudaDataType Btype,int ldb,
     const void* beta, void* C, cudaDataType Ctype,int ldc, cublasComputeType_t ct, cublasGemmAlgo_t algo){
   (void)algo; int in, out; if (gemm_contract(Atype, Btype, Ctype, ct, &in, &out)) return CUBLAS_STATUS_NOT_SUPPORTED;
-  return launch_gemm((struct tinyblas_handle*)h, ta,tb, m,n,k, cublas_scalar(alpha,ct),A,lda,B,ldb,cublas_scalar(beta,ct),C,ldc, in, out);
+  return launch_gemm((struct tinyblas_handle*)h, ta,tb, m,n,k, cublas_scalar(alpha,ct),A,lda,B,ldb,cublas_scalar(beta,ct),C,ldc, in, out,
+                     f32_tf32((struct tinyblas_handle*)h, ct));
 }
 // strided/batched: loop the single-GEMM launch (correctness-first; a batched kernel comes with the tensor-core version)
 cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,int n,int k,
@@ -264,7 +285,10 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t h, cublasOperation_t ta
   (void)algo; int in, out; if (gemm_contract(At, Bt, Ct, ct, &in, &out)) return CUBLAS_STATUS_NOT_SUPPORTED;
   float al=cublas_scalar(alpha,ct), be=cublas_scalar(beta,ct);
   int esz = in==0?4:2, osz = out==0?4:2;   // A/B stride in input elements, C stride in output elements
-  if ((in==1 || in==0) && tc_enabled() && (in==0 ? tinycublas_gemm_tf32_kernel() : tinycublas_gemm_tc_kernel()))
+  int tf32 = f32_tf32((struct tinyblas_handle*)h, ct);
+  if (in==1 && tc_enabled() && tinycublas_gemm_tc_kernel())
+    return launch_gemm_tc((struct tinyblas_handle*)h, ta,tb, m,n,k, al, A,lda,sA, B,ldb,sB, be, C,ldc,sC, batch, in, out);
+  if (in==0 && tf32 && tc_enabled() && tinycublas_gemm_tf32_kernel())
     return launch_gemm_tc((struct tinyblas_handle*)h, ta,tb, m,n,k, al, A,lda,sA, B,ldb,sB, be, C,ldc,sC, batch, in, out);
   if (in==2 && tc_enabled()) {   // bf16: one batched launch on the vectorised kernels when they take it, as f16
     cublasStatus_t st = launch_gemm_tc((struct tinyblas_handle*)h, ta,tb, m,n,k, al, A,lda,sA, B,ldb,sB, be, C,ldc,sC, batch, in, out);
@@ -273,12 +297,17 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t h, cublasOperation_t ta
   for (int i=0;i<batch;i++){
     cublasStatus_t s=launch_gemm((struct tinyblas_handle*)h, ta,tb, m,n,k, al,
       (const char*)A+(long)i*sA*esz,lda, (const char*)B+(long)i*sB*esz,ldb, be,
-      (char*)C+(long)i*sC*osz,ldc, in, out);
+      (char*)C+(long)i*sC*osz,ldc, in, out, tf32);
     if (s!=CUBLAS_STATUS_SUCCESS) return s;
   }
   return CUBLAS_STATUS_SUCCESS;
 }
 const char* tinycublas_note(void){ return "libtinycublas: residual GEMM subset over one tinyblas_gemm cubin"; }
+// The f32 kernel choice as a card-free row (test/cublas_contract.c, like tinycublas_splitk_plan for split-K): 1 when an
+// f32 GEMM on this handle with this compute type runs on the TF32 tensor cores, 0 when it runs on the exact fp32 kernel.
+int tinycublas_f32_uses_tf32(cublasHandle_t h, cublasComputeType_t ct){
+  return f32_tf32((const struct tinyblas_handle*)h, ct);
+}
 
 // --- the rest of the linked surface ---
 const char* cublasGetStatusString(cublasStatus_t s){ switch(s){ case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS"; case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
@@ -290,26 +319,28 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t h, cublasOperation_t ta,
 }
 // pointer-array batches: the arrays of matrix pointers live in DEVICE memory, so read them back before looping
 static cublasStatus_t batched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,int n,int k, float alpha,
-    const void* const* Ad,int lda, const void* const* Bd,int ldb, float beta, void* const* Cd,int ldc, int batch, int in, int out){
+    const void* const* Ad,int lda, const void* const* Bd,int ldb, float beta, void* const* Cd,int ldc, int batch, int in, int out, int tf32){
   if (batch<=0) return CUBLAS_STATUS_SUCCESS;
   void **A=malloc(sizeof(void*)*batch), **B=malloc(sizeof(void*)*batch), **C=malloc(sizeof(void*)*batch);
   tinynv_stream_t s=((struct tinyblas_handle*)h)->stream; cublasStatus_t rc=CUBLAS_STATUS_EXECUTION_FAILED;
   if (tinynv_memcpy_dtoh(s,A,(tinynv_devptr_t)Ad,sizeof(void*)*batch)==TINYNV_OK && tinynv_memcpy_dtoh(s,B,(tinynv_devptr_t)Bd,sizeof(void*)*batch)==TINYNV_OK
       && tinynv_memcpy_dtoh(s,C,(tinynv_devptr_t)Cd,sizeof(void*)*batch)==TINYNV_OK && tinynv_stream_sync(s)==TINYNV_OK){
     rc=CUBLAS_STATUS_SUCCESS;
-    for (int i=0;i<batch && rc==CUBLAS_STATUS_SUCCESS;i++) rc=launch_gemm((struct tinyblas_handle*)h,ta,tb,m,n,k,alpha,A[i],lda,B[i],ldb,beta,C[i],ldc,in,out);
+    for (int i=0;i<batch && rc==CUBLAS_STATUS_SUCCESS;i++) rc=launch_gemm((struct tinyblas_handle*)h,ta,tb,m,n,k,alpha,A[i],lda,B[i],ldb,beta,C[i],ldc,in,out,tf32);
   }
   free(A); free(B); free(C); return rc;
 }
 cublasStatus_t cublasSgemmBatched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,int n,int k, const float* alpha,
     const float* const A[],int lda, const float* const B[],int ldb, const float* beta, float* const C[],int ldc, int batch){
-  return batched(h,ta,tb,m,n,k,*alpha,(const void* const*)A,lda,(const void* const*)B,ldb,*beta,(void* const*)C,ldc,batch,0,0);
+  return batched(h,ta,tb,m,n,k,*alpha,(const void* const*)A,lda,(const void* const*)B,ldb,*beta,(void* const*)C,ldc,batch,0,0,
+                 f32_tf32((struct tinyblas_handle*)h, CUBLAS_COMPUTE_32F));
 }
 cublasStatus_t cublasGemmBatchedEx(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,int n,int k, const void* alpha,
     const void* const A[], cudaDataType At,int lda, const void* const B[], cudaDataType Bt,int ldb, const void* beta, void* const C[], cudaDataType Ct,int ldc,
     int batch, cublasComputeType_t ct, cublasGemmAlgo_t algo){
   (void)algo; int in, out; if (gemm_contract(At, Bt, Ct, ct, &in, &out)) return CUBLAS_STATUS_NOT_SUPPORTED;
-  return batched(h,ta,tb,m,n,k,cublas_scalar(alpha,ct),A,lda,B,ldb,cublas_scalar(beta,ct),C,ldc,batch,in,out);
+  return batched(h,ta,tb,m,n,k,cublas_scalar(alpha,ct),A,lda,B,ldb,cublas_scalar(beta,ct),C,ldc,batch,in,out,
+                 f32_tf32((struct tinyblas_handle*)h, ct));
 }
 cublasStatus_t cublasStrsmBatched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans, cublasDiagType_t diag,
     int m,int n, const float* alpha, const float* const A[],int lda, float* const B[],int ldb, int batch){

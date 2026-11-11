@@ -20,7 +20,10 @@
 //   * a second launch into another output with ckpt == NULL must reproduce the first one bit for bit (the checkpoints are
 //     stores; letting them change the arithmetic would be a bug);
 //   * replaying the last segment on the host from the kernel's own 64-KB checkpoint must reproduce the o the kernel wrote
-//     for the tokens of that segment — the checkpoint's contents and the moment it was written, both.
+//     for the tokens of that segment — the checkpoint's contents and the moment it was written, both;
+//   * the chunked path's arena (plan M8.2) is prefilled with garbage before its first launch: it is scratch, so every
+//     element it reads has to be written by the same call, and one that is not shows up as a failure on any device
+//     rather than as whatever the allocator left there (G-m8probe finding 1: the strictly-upper T had no writer).
 //
 // `bwd` runs the same batches (plus a uniform B = 8 at the dataset's median row length, for the one-call time) through
 // gdn_fwd for the checkpoints and then gdn_bwd, and checks dq, dk, dv, dg and dbeta against ref_gdn_bwd. Two more
@@ -178,6 +181,12 @@ static void case_fwd(const int *lens, int B, const char *tag, int replay_h) {
   CB(cublasCreate(&plan.blas));
   plan.arena = (float *)dev_alloc(narena * sizeof *plan.arena);
   plan.arena_n = narena;
+  // The chunked arena is scratch, not state: every element the path reads has to be written by that same call. Fill the
+  // part of it the path uses with huge finite floats before the first chunked launch, so a buffer -- or one triangle of
+  // one, which is how G-m8probe finding 1 hid on gpubox -- that is read before it is written fails a check here on every
+  // device instead of reading whatever the allocator left behind. The sequential kernels never touch the arena, so this
+  // is also the state the ambient run starts from.
+  CK(cudaMemset(plan.arena, 0x7f, gdn_chunk_arena_floats(B, H) * sizeof *plan.arena));
   printf("    (main run: %s kernels; the cross-check covers both)\n",
          gdn_chunked_enabled() ? "chunked" : "sequential");
 
@@ -401,6 +410,9 @@ static void case_bwd(const int *lens, int B, const char *tag, int sp_h, int norm
   CB(cublasCreate(&plan.blas));
   plan.arena = (float *)dev_alloc(narena * sizeof *plan.arena);
   plan.arena_n = narena;
+  // case_fwd's fill, for the same reason: with the chunked path on (JT_GDN_CHUNKED=1) the backward's own arena read must
+  // be covered too. The sequential backward keeps its replay in wk.sp, which is garbage-filled below.
+  CK(cudaMemset(plan.arena, 0x7f, gdn_chunk_arena_floats(B, H) * sizeof *plan.arena));
   gdn_bwd_work wk;
   wk.sp = (float *)dev_alloc(nsp * sizeof *wk.sp);
   wk.dq_part = (float *)dev_alloc(npart * sizeof *wk.dq_part);

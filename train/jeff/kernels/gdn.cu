@@ -276,11 +276,18 @@ __global__ void gdn_chunk_mask_kernel(int C, float *kk, float *qq, float *lm, fl
 
 // T = (I+L)^{-1} by forward substitution, one column per thread: T[i][c] = -sum_{j=c}^{i-1} L[i][j] T[j][c]. The work is
 // O(C^3/6) per chunk and stays inside a block; each thread reads its own column of the output, so no barrier is needed.
+//
+// T is lower triangular, and the GEMMs below take the *whole* matrix (Delta = T X, dX = T^T dDelta, ...), so the strictly
+// upper part has to be written here and not left as the arena's leftovers: this kernel writes rows c..C-1 of column c,
+// i.e. the lower triangle only, so a thread zeroes its own column's rows above the diagonal first (G-m8probe finding 1:
+// on gpubox a fresh cudaMalloc happens to be zero and the read of the upper triangle was invisible there, while the
+// shim's arena is recycled video memory and the leftover fired into the delta system, which amplified it to 0.14-0.42).
 __global__ void gdn_chunk_trinv_kernel(int C, const float *lm, float *tm) {
   const int c = (int)threadIdx.x;
   if (c >= C) return;
   const float *L = lm + (size_t)blockIdx.x * (size_t)C * (size_t)C;
   float *T = tm + (size_t)blockIdx.x * (size_t)C * (size_t)C;
+  for (int i = 0; i < c; i++) T[(size_t)i * C + c] = 0.0f; // the upper part, never entered by the loop below
   T[(size_t)c * C + c] = 1.0f;
   for (int i = c + 1; i < C; i++) {
     float acc = 0.0f;
