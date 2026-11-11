@@ -618,10 +618,71 @@ static void store_open(const JtCtx *c, Store *p, const JtBatch *b, int n) {
   if (saves_pm + store_ckpt_floats(c) > store_floats(c) - store_work_floats(c))
     die("store: %zu floats of slots and %zu of checkpoints do not fit under the %zu-word work region",
         saves_pm, store_ckpt_floats(c), store_work_floats(c));
-  const size_t have = (size_t)(c->arena_n - base_arena_floats(c)); // store_floats(c)
+  // The store proper ends where jt_ctx_alloc put it; anything above that is the guard (JT_NO_RECOMPUTE_GUARD), which no
+  // piece may touch. `c->arena_n` is base + store + guard, so the guard's size is the difference.
+  if (c->arena_n < base_arena_floats(c) + store_floats(c))
+    die("store: the arena holds %zu floats, the store needs %zu", c->arena_n,
+        base_arena_floats(c) + store_floats(c));
   p->base = c->arena + base_arena_floats(c);
-  p->top = p->base + have;
+  p->top = p->base + store_floats(c);
   p->n = n;
+}
+
+// ---- the guard above the work region (diagnostic: JT_NO_RECOMPUTE_GUARD=<KB>) ------------------------------------------
+// The work region ends at the last word the store owns, and above it is either padding the driver mapped (a few hundred KB
+// at most) or nothing: so a piece that writes past its own top buffer does not corrupt anything, it kills the run with an
+// MMU fault that names no kernel - which is exactly the state the card was in on 2026-11-11 (fault 0x1592e01000, 1 MB past
+// the end of the arena+store). With a guard the same write lands in memory nobody reads, the sweep checks the guard after
+// every piece, and the message names the layer, the piece and how far past the end the write went.
+static size_t guard_floats(void) {
+  const char *s = getenv("JT_NO_RECOMPUTE_GUARD");
+  if (s == NULL || s[0] == '\0') return 0;
+  char *end = NULL;
+  const long kb = strtol(s, &end, 10);
+  if (end == s || kb <= 0) return 0;
+  return (size_t)kb * 1024 / sizeof(float);
+}
+#define JT_GUARD_BYTE 0xA5
+
+static void guard_scan(const Store *p, const char *what) {
+  const size_t g = guard_floats();
+  if (g == 0) return;
+  // `p->top` is the store's first word past the end, i.e. the guard's first word, and it does not move as the layer loop
+  // re-binds c->arena to each layer's slot (c->arena + base + store would).
+  const float *base = p->top;
+  float *host = (float *)malloc(g * sizeof(float));
+  if (host == NULL) die("out of host memory (the %zu-float guard)", g);
+  CK(cudaMemcpy(host, base, g * sizeof(float), cudaMemcpyDeviceToHost));
+  const unsigned char *b = (const unsigned char *)host;
+  const size_t bytes = g * sizeof(float);
+  size_t first = bytes, last = 0, hits = 0;
+  for (size_t i = 0; i < bytes; i++) {
+    if (b[i] == JT_GUARD_BYTE) continue;
+    if (first == bytes) first = i;
+    last = i;
+    hits++;
+  }
+  if (hits == 0) { free(host); return; }
+  fprintf(stderr, "guard: %s touched the %zu bytes above the store's work region: %zu byte(s) not the poison, "
+                  "first at +%zu (float %zu), last at +%zu (float %zu) - a %zu-byte span\n",
+          what, bytes, hits, first, first / sizeof(float), last, last / sizeof(float), last - first + 1);
+  const size_t show = first + 64 < bytes ? first + 64 : bytes;
+  for (size_t i = first; i < show; i += 16) {
+    fprintf(stderr, "guard:   +%zu:", i);
+    for (size_t j = i; j < i + 16 && j < show; j++) fprintf(stderr, " %02x%s", b[j], b[j] == JT_GUARD_BYTE ? "" : "*");
+    fprintf(stderr, "\n");
+  }
+  free(host);
+  die("%s wrote past the end of the store's work region (first byte +%zu, span %zu): that is the step to look at", what,
+      first, last - first + 1);
+}
+
+// The sweep's own checks: one per piece, naming the layer.
+static void guard_check(const Store *p, const char *piece, int layer) {
+  if (guard_floats() == 0) return;
+  char what[96];
+  snprintf(what, sizeof what, "layer %d's %s", layer, piece);
+  guard_scan(p, what);
 }
 
 // The save cursor after a SAVE pass must be the width this file budgets for that piece: if a piece's layout changed, stop
@@ -669,12 +730,31 @@ JtCtx *jt_ctx_alloc(Model *m, Lora *l, int cap_tokens, int cap_rows, int lmax) {
   // the whole allocation's size in that mode, which is how every later call knows the store is there.
   const size_t arena_base = base_arena_floats(c);
   const int store = no_recompute_env();
+  const size_t guard = store ? guard_floats() : 0; // diagnostic only (JT_NO_RECOMPUTE_GUARD), never part of the store
   c->arena_n = arena_base;
-  if (store) c->arena_n += store_floats(c);
+  if (store) c->arena_n += store_floats(c) + guard;
   CK(cudaMalloc((void **)&c->arena, c->arena_n * sizeof(float)));
   c->work_at = arena_base;
   c->save_at = 0;
-  const size_t store_n = c->arena_n - arena_base;
+  const size_t store_n = c->arena_n - arena_base - guard;
+  if (guard) { // the poison the sweeps check: a byte pattern, so a partial write is as visible as a whole float. A plain
+    // host copy rather than a memset kernel, so the null device (where kernels do not run) poisons it too and the check
+    // stays testable without the card.
+    const size_t chunk = 1u << 20;
+    unsigned char *pat = (unsigned char *)malloc(chunk);
+    if (pat == NULL) die("out of host memory (the guard poison)");
+    memset(pat, JT_GUARD_BYTE, chunk);
+    unsigned char *dst = (unsigned char *)(c->arena + arena_base + store_floats(c));
+    for (size_t done = 0; done < guard * sizeof(float); done += chunk) {
+      const size_t n = guard * sizeof(float) - done < chunk ? guard * sizeof(float) - done : chunk;
+      CK(cudaMemcpy(dst + done, pat, n, cudaMemcpyHostToDevice));
+    }
+    free(pat);
+    CK(cudaStreamSynchronize(c->stream));
+    printf("ctx: no-recompute guard: %.2f MB of poison above the work region (JT_NO_RECOMPUTE_GUARD); a write past the "
+           "store ends the run at the piece that made it instead of faulting the card\n",
+           (double)guard * sizeof(float) / 1e6);
+  }
 
   const size_t ckpt = gdn_ckpt_floats(cap_rows, MT_GDN_HEADS, c->gdn_nseg);
   const size_t sp = gdn_bwd_sp_floats(cap_rows, MT_GDN_HEADS);
@@ -806,11 +886,13 @@ static int store_forward(JtCtx *c, const Store *st, const JtBatch *b, float *sav
                                 : layer_gdn_mixer_fwd(c, lw, x_in, n, b, pm, JT_FWD_SAVE);
     if (rc != JT_LAYER_OK) return rc;
     store_check("mixer", i, c->save_at, mixer);
+    guard_check(st, "mixer forward", i);
 
     store_bind(c, st, slot + mixer, 0); // the MLP's saves directly above the mixer's, its work from the same top
     rc = layer_mlp_fwd(c, lw, pm, n, b, saved_in + (size_t)(i + 1) * stride, JT_FWD_SAVE);
     if (rc != JT_LAYER_OK) return rc;
     store_check("MLP", i, c->save_at, JT_MLP_SAVES_PER_TOKEN * (size_t)n);
+    guard_check(st, "MLP forward", i);
   }
   return JT_LAYER_OK;
 }
@@ -837,12 +919,14 @@ static int store_backward(JtCtx *c, const Store *st, const JtBatch *b, const flo
     store_bind(c, st, slot + mixer, 0); // the MLP's block, at its own base (jt_saves_reset + the block's own width)
     int rc = layer_mlp_bwd(c, lw, pm, dres, n, b);
     if (rc != JT_LAYER_OK) return rc;
+    guard_check(st, "MLP backward", i);
 
     store_bind(c, st, slot, mixer); // the mixer's block at the slot's base, the cursor where its replay expects it
     if (!ml->full_attention) c->gdn_ckpt = st->base + store_ckpt_off(c, gdn_index, n);
     rc = ml->full_attention ? layer_attn_mixer_bwd(c, lw, x_in, dres, n, b)
                             : layer_gdn_mixer_bwd(c, lw, x_in, dres, n, b);
     if (rc != JT_LAYER_OK) return rc;
+    guard_check(st, "mixer backward", i);
   }
   return JT_LAYER_OK;
 }

@@ -239,7 +239,13 @@ int layer_gdn_mixer_fwd(JtCtx *c, const LayerWeights *lw, const float *x_in, int
 // The backward's buffers, in the order design §4.8 needs them. All are work temporaries (the forward's saves are read
 // where they lie), per packed token, and given back before this function returns.
 typedef struct {
-  float *dy;                     // dL/d(y): out_proj's dy, then the gated norm's dy            [1024]
+  // dL/d(y), and its width is the gated norm's output (kw = 2048), not the hidden size: out_proj's dx IS this buffer,
+  // and then the gated norm's backward reads it as its dy. It was budgeted at MT_HIDDEN until 2026-11-11, so the two
+  // GEMMs below wrote a second [n][1024] slab past its end: on the recompute path that slab lands on scratch this layer's
+  // MLP backward has already finished with (and the gated norm reads back the slab the GEMMs just wrote, so the numbers
+  // were right and nothing showed), while on --no-recompute dy is the first work buffer of the piece, i.e. the top of the
+  // store, and the slab left the allocation - the card's mmu fault.
+  float *dy;                     // dL/d(y): out_proj's dx, then the gated norm's dy              [2048]
   float *dout, *dz;              // dL/d(o) (gdn_bwd's dout) and dL/d(z)                        [2048] each
   float *dqh, *dch;              // dq|dk from gdn_bwd, then dq|dk|dv after the two l2norms    [2x2048], [3x2048]
   float *dcv, *dqkv;             // dL/d(cv) token-major (conv_bwd's dout), then dL/d(qkv)      [6144] each
@@ -250,7 +256,7 @@ typedef struct {
 
 static void bwd_get(JtCtx *c, int n, GdnBwd *g) {
   const size_t kw = GDN_W, kq = GDN_QKV_W, kh = GDN_HEADS;
-  g->dy = take(c, 0, MT_HIDDEN, n);
+  g->dy = take(c, 0, kw, n); // kw, not MT_HIDDEN: see the field's comment
   g->dout = take(c, 0, kw, n);
   g->dz = take(c, 0, kw, n);
   g->dqh = take(c, 0, 2 * kw, n);
