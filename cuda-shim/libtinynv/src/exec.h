@@ -219,6 +219,14 @@ typedef struct {
     // envelope over every launch in the flush. See tinynv_exec_flush.
     uint32_t len;
     uint32_t kslot;      // TINYNV_KERNEL_PROFILE: the ring slot this launch stamps, or TINYNV_KPROF_SLOTS for none
+    // What this launch is, for the stall report. The bytes are the cubin's own string, so they live as long as the
+    // module does; a fixed array would be a copy per launch for a name that never changes.
+    const char *kname;
+    // And its parameters, the first 12 words of them: enough for every kernel here to show A/B/C and the geometry, which
+    // is what a fault needs to be read against (a pointer outside every allocation says the driver handed the kernel a
+    // bad address; a pointer inside one says the kernel indexed out of it).
+    uint32_t plen;
+    uint64_t par[12];
   } chain[TINYNV_EXEC_CHAIN_MAX];
   int nchain;
   int chain_max;   // how deep a chain may get before it is handed over; TINYNV_EXEC_CHAIN_MAX unless asked otherwise
@@ -246,6 +254,10 @@ typedef struct {
     uint64_t slot;      // the ring slot it went into, so the entry can be read back and compared
     uint64_t head_va;   // the chain head's descriptor, 0 if this is not a launch batch
     uint64_t head_sum;  // and a checksum of that descriptor as it was written, to catch it being overwritten since
+    // The chain's FIRST kernel, by name. With TINYNV_CHAIN_DEPTH=1 a batch is one launch, so this is the kernel the
+    // engine stopped at - which is the question a stall report could not answer by address (`head_va` names a
+    // descriptor, not a kernel, and a 128-launch chain's head is only one of the 128 that may have faulted).
+    char kname[64];
     uint32_t dwords;
     uint8_t copy;       // which ring it went to
     uint8_t links;      // how many launches were chained in it, 0 if it is not a launch batch
@@ -265,6 +277,19 @@ typedef struct {
   // was in the command buffer all along. A report that names one of two waits is worse than one that names neither.
   uint64_t pending_acquire, pending_acquire_other;
   uint64_t pending_head_va, pending_head_sum;   // and the same for the chain head, handed from flush
+  const char *pending_head_kernel;              // and the chain head's kernel name, likewise
+  uint32_t pending_head_plen;                   // and its parameters, the first 12 words
+  uint64_t pending_head_par[12];
+  // THE LAST FEW LAUNCHES, BY KERNEL. A fault is detected at the poll after a submission, so the launch that touched the
+  // bad address is the one just handed over or one of the handful before it - the chain's timeline value cannot say
+  // which, because a kernel that faults on some of its blocks still releases its semaphore. With TINYNV_CHAIN_DEPTH=1
+  // this is one launch per submission and the newest entry is the answer (2026-11-11, the store's mmu fault).
+#define TINYNV_EXEC_RECENT 16
+  const char *recent[TINYNV_EXEC_RECENT];
+  uint64_t recent_upto[TINYNV_EXEC_RECENT];
+  uint32_t recent_plen[TINYNV_EXEC_RECENT];
+  uint64_t recent_par[TINYNV_EXEC_RECENT][12];
+  int nrecent;
   tinynv_queue_t *last_q; // which queue the last batch went to, so a switch can be ordered against it
   int ready;
   // Wait for every batch before returning, the way this file worked before d29cb32. Slow - it is a round trip to the

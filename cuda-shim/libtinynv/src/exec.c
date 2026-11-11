@@ -740,12 +740,15 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
                 "is the one that matters)\n", (unsigned long long)ex->ndropped);
       int shown = 0;
       uint64_t pm_head = 0;
+      const char *parked = NULL;   // the oldest unfinished compute batch's first kernel: what the channel stopped at
       for (int i = 0; i < ex->ntrail; i++) {
         size_t at = (size_t)i;
         if (ex->trail[at].upto <= v) continue;   // already done
         fprintf(stderr, "tinynv:   #%llu %s cmdbuf %#llx %u dwords, %u chained, reaches %llu",
                 (unsigned long long)ex->trail[at].seq, ex->trail[at].copy ? "copy   " : "compute", (unsigned long long)ex->trail[at].va,
                 ex->trail[at].dwords, ex->trail[at].links, (unsigned long long)ex->trail[at].upto);
+        if (ex->trail[at].kname[0])
+          fprintf(stderr, ", kernel %s%s", ex->trail[at].kname, ex->trail[at].links > 1 ? " (its first of the chain)" : "");
         if (ex->trail[at].acquire)
           fprintf(stderr, ", waits for %llu%s", (unsigned long long)ex->trail[at].acquire,
                   ex->trail[at].acquire > v ? "  <-- NOT YET RELEASED, this channel is parked here" : " (already released)");
@@ -788,8 +791,15 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
           }
         }
         shown++;
+        if (!parked && !ex->trail[at].copy && ex->trail[at].kname[0]) parked = ex->trail[at].kname;
       }
       if (!shown) fprintf(stderr, "tinynv:   none - everything submitted has finished, so what is missing was never submitted\n");
+      // The one line the addresses cannot give: the oldest unfinished compute batch is where the channel stopped, and
+      // its kernel is the kernel that was running when it stopped. TINYNV_CHAIN_DEPTH=1 makes that batch one launch, so
+      // this is exact rather than "one of the 128 in this chain".
+      if (parked)
+        fprintf(stderr, "tinynv: the channel stopped at %s%s; the parenthesised fault address, if any, belongs to it\n",
+                parked, ex->trail[0].links > 1 ? "'s chain" : "");
       postmortem_desc(ex, pm_head);
       return tinynv_fail("the engines did not reach %llu within %.1fs (compute is at %llu, copy at %llu): %s%s%s",
                          (unsigned long long)value, seconds, (unsigned long long)v, (unsigned long long)vcopy,
@@ -1101,7 +1111,36 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
   return 0;
 }
 
-// Hand a finished batch to a queue and wait for it. The release at the end of every batch is what is waited on.
+// A fault is reported by the poll that follows a submission, so the kernels to name are the ones just handed over. This
+// prints them newest first with the timeline value each will have reached, and the fault address if the report carried
+// one. Newest first because the failing launch is normally the last one, and oldest-last reads as "and before that".
+static void fault_context(tinynv_exec_t *ex) {
+  const tinynv_gsp_t *gsp = &ex->g->gsp;
+  if (gsp->fault_have)
+    fprintf(stderr, "tinynv: the fault the last submission(s) hit: %#llx (named above with its kind and access)\n",
+            (unsigned long long)gsp->fault_va);
+  const int n = ex->nrecent < TINYNV_EXEC_RECENT ? ex->nrecent : TINYNV_EXEC_RECENT;
+  if (!n) return;
+  fprintf(stderr, "tinynv: the last %d launch%s, newest first (TINYNV_CHAIN_DEPTH=1 makes each one a submission):\n", n,
+          n == 1 ? "" : "es");
+  for (int i = 0; i < n; i++) {
+    const int at = (ex->nrecent - 1 - i) % TINYNV_EXEC_RECENT;
+    fprintf(stderr, "tinynv:   %s (reaches %llu)\n", ex->recent[at], (unsigned long long)ex->recent_upto[at]);
+    // Its parameters, word by word. A word that looks like an address is checked against the allocations the driver has
+    // handed out: "not in any allocation" is a driver bug (a stale or garbage pointer was passed down), while a word
+    // that IS in one means the kernel indexed out of a buffer it was given. Those are different fixes.
+    const uint32_t words = ex->recent_plen[at] / 8 < 12 ? ex->recent_plen[at] / 8 : 12;
+    for (uint32_t w = 0; w < words; w++) {
+      const uint64_t v = ex->recent_par[at][w];
+      if (v < 0x100000000ull) continue;   // not an address: a shape, a stride, a count
+      char tag[64] = "";
+      const int inside = tinynv_va_ledger_tag(v, tag, sizeof tag);
+      fprintf(stderr, "tinynv:     param[%u] = %#llx  %s%s%s\n", w, (unsigned long long)v,
+              inside ? "in \"" : "NOT IN ANY ALLOCATION", inside ? tag : "", inside ? "\"" : "");
+    }
+  }
+}
+
 // The half that is the same however the batch releases: make the bytes visible, hand them over, and move the timeline
 // to what the batch will have reached. Synchronously, wait for it here.
 static int submit_batch(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c, uint64_t cmdbuf_va, uint64_t upto,
@@ -1113,6 +1152,8 @@ static int submit_batch(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c
     ex->trail[at].slot = q->entries ? q->put % q->entries : 0;
     ex->trail[at].head_va = ex->pending_head_va;
     ex->trail[at].head_sum = ex->pending_head_sum;
+    snprintf(ex->trail[at].kname, sizeof(ex->trail[at].kname), "%s",
+             ex->pending_head_kernel ? ex->pending_head_kernel : "");
     ex->trail[at].va = cmdbuf_va;
     ex->trail[at].acquire = ex->pending_acquire;
     ex->trail[at].acquire_other = ex->pending_acquire_other;
@@ -1123,7 +1164,18 @@ static int submit_batch(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c
   } else {
     ex->ndropped++;
   }
+  // Keep the last few launches by name, for the fault that is reported at the poll below (see exec.h's `recent`).
+  if (ex->pending_head_kernel) {
+    const int at = ex->nrecent % TINYNV_EXEC_RECENT;
+    ex->recent[at] = ex->pending_head_kernel;
+    ex->recent_upto[at] = upto;
+    ex->recent_plen[at] = ex->pending_head_plen;
+    memcpy(ex->recent_par[at], ex->pending_head_par, sizeof ex->pending_head_par);
+    ex->nrecent++;
+  }
   ex->pending_head_va = ex->pending_head_sum = 0;
+  ex->pending_head_kernel = NULL;
+  ex->pending_head_plen = 0;
   ex->pending_acquire = ex->pending_acquire_other = 0;
 
   // The one crossing. Everything this batch needs the engine to read - descriptors, constant buffers, the command
@@ -1695,6 +1747,9 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   ex->flush_n = n;
   ex->pending_head_va = ex->chain[0].va;
   ex->pending_head_sum = qmd_sum(ex->chain[0].host);
+  ex->pending_head_kernel = ex->chain[0].kname;
+  ex->pending_head_plen = ex->chain[0].plen;
+  memcpy(ex->pending_head_par, ex->chain[0].par, sizeof ex->pending_head_par);
   ex->in_chain_flush = 0;
   // The keep-alive, if one is spinning, is let go just before the caller's chain is handed over: the chain acquires on
   // the keep-alive's own timeline value, which it releases the moment it sees the flag. The driver's own work (the
@@ -1704,7 +1759,7 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // Once per chain rather than once per launch: see tinynv_exec_run. This reports on work already handed over, which
   // is what it reported on before too - a launch that has not been submitted cannot have faulted.
   { PROF_START(ex); int bad = tinynv_gsp_poll(ex->g); PROF_END(ex, PROF_POLL);
-    if (bad) return tinynv_fail("gsp-rm reported a fault, logged above"); }
+    if (bad) { fault_context(ex); return tinynv_fail("gsp-rm reported a fault, logged above"); } }
   PROF_END(ex, PROF_FLUSH);
   return 0;
 }
@@ -1817,7 +1872,7 @@ int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
   }
   ex->defer_ring = 0;
   { PROF_START(ex); int bad = tinynv_gsp_poll(ex->g); PROF_END(ex, PROF_POLL);
-    if (bad) return tinynv_fail("gsp-rm reported a fault, logged above"); }
+    if (bad) { fault_context(ex); return tinynv_fail("gsp-rm reported a fault, logged above"); } }
   r->launches++;
   ex->graph_replays++;
   if (ex->profile) { ex->graph_last_at0 = at0; ex->graph_last_n = r->nchains < 64 ? r->nchains : 64; }
@@ -2450,6 +2505,10 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   ex->chain[ex->nchain].va = qmd_va;
   ex->chain[ex->nchain].len = (uint32_t)(slot + cbuf0_bytes);
   ex->chain[ex->nchain].kslot = kslot_i;
+  ex->chain[ex->nchain].kname = k->name;
+  ex->chain[ex->nchain].plen = (uint32_t)params_len;
+  memset(ex->chain[ex->nchain].par, 0, sizeof ex->chain[ex->nchain].par);
+  if (params_len) memcpy(ex->chain[ex->nchain].par, params, params_len < sizeof ex->chain[ex->nchain].par ? params_len : sizeof ex->chain[ex->nchain].par);
   ex->nchain++;
   if (!ex->internal_work) ex->launches_since_ka++;
   // TINYNV_RING_ASYNC: the previous chain's announcement is completed here, sixteen launches in, by which time its

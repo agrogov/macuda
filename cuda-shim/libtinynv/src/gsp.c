@@ -757,6 +757,22 @@ static void fault_report(tinynv_gpu_t *g) {
     // list has not been cleared since". Nothing here clears it, so the older entries can be from earlier runs.
     if (n > 1) fprintf(stderr, "tinynv:   (this list is kept until newer faults push entries out, so an older one may "
                                "be a repeat rather than a separate fault)\n");
+    // WHICH KERNEL (2026-11-11). The address says what was touched and nothing about who touched it, and the kernel
+    // was the open question on the store's mmu fault. The SMs' own error states carry the faulting warp's pc, and the
+    // image ranges are printed as `IMAGE PLACED <kernel> [start, end)` at each module's first launch, so a pc names the
+    // kernel and the instruction offset inside it. Printed only when a pc is set, and only the first few: the target
+    // channel's fault shows on the SMs that were running it, which is one or two.
+    int pcs = 0;
+    for (uint32_t i = 0; i < st->numSMsToRead && i < TINYNV_DEBUG_MAX_SMS_PER_CALL; i++) {
+      const tinynv_sm_error_state_t *e = &st->smErrorStateArray[i];
+      if (!e->hwwWarpEsrPc64) continue;
+      if (pcs == 4) { fprintf(stderr, "tinynv:   (more SMs report a pc; the first four are enough)\n"); break; }
+      fprintf(stderr, "tinynv:   SM %u was at warp pc %#llx (warp esr %#x); the kernel is the one whose IMAGE PLACED "
+                      "range holds it\n",
+              i, (unsigned long long)e->hwwWarpEsrPc64, e->hwwWarpEsr);
+      pcs++;
+    }
+    if (!pcs) fprintf(stderr, "tinynv:   no SM reported a warp pc, so this fault has no kernel named here\n");
   } else {
     // No MMU fault, so the addresses are not the story. What is left is the SMs' own error registers, which say a
     // kernel did something illegal rather than touched something unmapped.
