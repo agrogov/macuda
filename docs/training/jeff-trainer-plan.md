@@ -61,7 +61,7 @@ in the same change.
 | M5 | backward, LoRA, Adam, schedule, prep.py batch order | one training step bit-close to PyTorch | gpubox, then one card check |
 | M6 | eval/step/run parity, timing | the whole trainer | gpubox |
 | M7 | eval parity, 20-step parity, timed arm on the shim | macuda can train Jeff | Mac + eGPU |
-| M8 | speed (bf16 weights, chunked GDN, fused kernels) | optional | both |
+| M8 | speed (bf16 weights, chunked GDN, fused kernels) | measured wins landed: bf16 weights + transposes + auto no-recompute; −53.8% card / −65.2% gpubox (G-m8final) | both |
 
 gpubox is the development box for M1–M6 because it has real nvcc and cuBLAS, so a failure there is jefftrain's
 own fault. Each piece passes on gpubox first and then goes to the card at the next checkpoint, so a failure that
@@ -873,7 +873,10 @@ B ~ N(0,1)·1e-2) where train.py starts at B = 0, a ~2e-2 LoRA update at step 0 
 1–3 argmax lines.
 
 `scripts/arm.sh` still takes its band from the Python runs only, so this gate is not reproducible from the script alone;
-accepting the jefftrain runs' directories the way `JT_REF_RUNS` accepts the Python ones is an open follow-up.
+accepting the jefftrain runs' directories the way `JT_REF_RUNS` accepts the Python ones is an open follow-up (G-m8arm
+hit the same wall: its BF16 arm holds both CE gates but misses 4/15 metrics against the Python-only band, and the
+non-BF16 TF32 arm misses one of the same metrics). Since G-m74 the band's count metrics carry a **floor of 2** test
+lines (the user's decision, 2026-11-10; the reasoning is in M7.4 and `scripts/arm.sh`'s header).
 
 ---
 
@@ -889,7 +892,8 @@ null device runs start-up, allocation and the launch sequence end to end.
 
 **Done when:** all three are green. If a symbol is missing, don't add it to the shim: change jefftrain to use an API
 from D§12's list, or ask the user. As built: `make shim ARCH=sm_120a` from clean 15.2 s, 0 warnings, 9 kernels +
-every host/ref/test object; `check-symbols: all 24 cuda*/cublas* symbol(s)`; `test-null: 8 test(s) passed`; and
+every host/ref/test object; `check-symbols: all 24 cuda*/cublas* symbol(s)` (25 since J51: the auto-store's refused probe is the first user of
+`cudaGetLastError`, which the shim defines); `test-null: 8 test(s) passed`; and
 `--eval-only` on a 4-row fixture ran to `rc 0` with 1273 `would launch …` lines, 0 CUDA errors, both output files
 written. The null device computes nothing, so its CE/agreement numbers are meaningless by construction — this proves
 start-up, allocation, the launch sequence and the writers, not numbers.
@@ -913,26 +917,142 @@ the gate, and the same comparison at `--max-dp 0.0001` fails, so it measures rat
 M8 is where speed gets work.
 
 ### M7.4 A timed arm on the card (ask; it holds the card for hours)
-One full arm, if the user wants it. Report s/step, peak memory and the D§10.3.3 metrics. Not run: at M7.3's 8.94 s/step
-a full arm is ~9 hours on the card, so this needs its own decision and a card held for that long.
+One full arm, if the user wants it. Report s/step, peak memory and the D§10.3.3 metrics.
+
+**As built (G-m74): run — three full soft arms** (seed 0, seed 1, and seed 0 again from `train.py`'s own start), each
+`exit 0` with 0 error lines: **1.675 / 1.708 / 1.675 s/step** (mean of the 143 logged steps), **1 h 57 min** each
+(7,006 s wall; 1.926 s/step all-in), peak **~9.84 GB of 24 GB (~41%)**, `gemm: tf32`. The peak is the sum of the
+start-up lines' allocations, not a sampled high-water mark: the shim's device-memory query returns nothing useful, so
+`report.json` prints `peak 0.00 GB` there (same caveat as G-m72/G-m73). The old text here — "not run: at M7.3's
+8.94 s/step a full arm is ~9 hours" — was wrong twice: 8.94 s/step is the shim's correctness-first **exact fp32**
+kernel, which the arm never uses; TF32 dispatches to `tinyblas_gemm_f32_tc` (64×64×32 tiles, wmma tensor cores). A
+20-step TF32 probe on M7.3's own batches measured **1.67 s/step vs exact's 8.94 (5.34x)** before the arms ran.
+
+**The gates pass** (D§10.3.3, four-run band): dev soft CE |Δ| **0.00185** (0.45562 vs 0.45746, gate 0.01), calibrated
+test soft CE |Δ| **0.00370** (0.49333 vs 0.48970, gate 0.02), **15/15** `score.py` metrics inside the band. Getting
+there took two things, both recorded in `scripts/arm.sh`'s header and `notes/G-m74.md`:
+
+1. **The right start.** `arm.sh` starts from `make_adapter.py`'s `B ~ N(0,1)·1e-2`; `train.py` starts at **B = 0**.
+   The third arm zeroed the 150 `lora_B` tensors (A and readout untouched) and 12 of 15 `score.py` metrics became
+   exactly equal to the Python arm's — the residual difference G-m64 had suspected was the start, confirmed.
+2. **A count floor of 2** (the user raised it from 1 on 2026-11-10). The band floored count metrics at 1 test line,
+   i.e. it demanded agreement to the last card. The one failing metric, `th0.9.maybe_cards` (5 vs 7), sat beside
+   `th0.9.tp 26 / fp 1 / fn 3` **identical** to the Python arm: the two disputed lines are cards both implementations
+   classify the same way whose calibrated probability sits within rounding distance of 0.9, landing either side of
+   the boundary after TF32 vs fp32 arithmetic — more slack than a 1-line floor resolves. With the floor at 2 **all
+   three arms pass 15/15**; the two CE gates are the design's own numbers and are untouched.
 
 **Done when:** the numbers are in Appendix B and the D§10.3.3 metrics are reported to the user, or the user has said
-to skip the arm.
+to skip the arm. **Done**: Appendix B carries the numbers; the logs are `logs/jefftrain/G-m74-*` (the git-ignored
+`logs/jefftrain/G-m74.md` is the earlier one-arm FAIL record; the tracked `notes/G-m74.md` supersedes it).
 
 ---
 
 ## M8. Speed (only after M6 passes; each item is its own change, re-gated by M6.1 + M6.2)
 
-In expected order of payoff:
-1. **bf16 frozen weights + bf16 GEMM inputs** where libtinycublas's bf16 fast path qualifies (D§6.1's alignment
-   rules), keeping fp32 activations elsewhere. Halves weight memory and bandwidth.
-2. **Chunked GDN** (fla's WY form): the recurrence becomes GEMMs over chunks of 64. Big win for the shim, where
-   tinycublas GEMMs are the strong path.
-3. **Fused kernels**: rmsnorm + the following linear's input cast; silu_mul into the down_proj prologue; the
-   attention softmax fused with the scores (flash-style) for L > 512.
-4. **No recompute** when memory allows (`--no-recompute`, which saves every layer's scratch): −25% time on the 5090.
-5. **CUDA-graph-free launch batching** on the shim: fewer, larger launches. Measure launch overhead first
-   (`cuda-shim/test/launch_copy_bench.c`).
+The original list, in expected order of payoff: (1) bf16 frozen weights + bf16 GEMM inputs, (2) chunked GDN (fla's WY
+form), (3) fused kernels (norm+cast, silu_mul prologue, flash-style attention for L > 512), (4) no recompute when
+memory allows, (5) CUDA-graph-free launch batching on the shim.
+
+**As built (J36–J51; card records G-m8probe, G-m8arm, G-m8final).** The batch ran under measurement rules, not
+expectations: a change lands only if it is **worth it** — `scripts/ab.sh` (J43) reports `WORTH: yes`: B at least 1.5%
+faster than A and the gap more than 3x the larger side's run-to-run spread, interleaved runs, median s/step over steps
+3..N — and **harmless**: bit-identical changes need `ab.sh --same` → `BITEXACT: yes` (exact mode, the 20-step
+`steps.jsonl` and both prediction files byte-identical); numerics-changing changes need M6.1 + M6.2 to hold with the
+toggle on and the default path to stay `BITEXACT: yes`. New behaviour sits behind a `JT_<NAME>` environment toggle
+(unset = the old path byte for byte, `=0` forces off) with one startup line the scripts check through `JT_EXPECT`, so
+a toggle that silently did nothing cannot pass. J43 built that tooling (`ab.sh`, `JT_ENV`/`JT_EXPECT` passthrough in
+the four gpubox scripts, one `flock` per run).
+
+Two wins outside the original list landed first:
+
+* **J44 — the head-major transposes** (the real prize J38's profiling found: `jt_to/from_head_major` launched 8 blocks
+  for the whole GPU). Now one block per (head, 16-token tile). Pure copies, bit-identical by construction:
+  `BITEXACT: yes`; TF32 **1.0150 → 0.3900 s/step (−61.58%)**, exact **1.1050 → 0.4750 (−57.01%)**, both `WORTH: yes`
+  (gaps 125x / 31.5x the spread). A fix, not a toggle.
+* **J46 — `jt_f32_to_bf16_n`**, the f32→bf16 cast kernel with its CPU reference and 13 bit-equal checks (J36's missing
+  piece; round-to-nearest-even on the integer bits, because sm_120's `cvt.rn.bf16.f32` returns 0x7fff for every NaN).
+
+Item by item, with the decision rule (J51's table) and where each removed feature's patch is:
+
+1. **bf16 frozen weights + bf16 GEMM inputs — LANDED, the TF32 default on both backends** (J36 measured the ceiling
+   and was blocked on the cast kernel; J46 built it; J47 the mode; J51 the default). All 473 checkpoint tensors are
+   BF16 on disk, so `Linear.Wb` keeps the checkpoint's own bits (weights **1.99 → 1.00 GB**, the fp32 copy is never
+   allocated); the two frozen-W GEMMs run `cublasGemmEx` with bf16 A/B, fp32 C, `COMPUTE_32F`, the activation cast per
+   call; D§6.1's alignment rule is `gemm_bf16_ok()` (row lengths multiples of 8, 16-byte-aligned bases), a failing
+   shape widens the weight and takes the fp32 path. gpubox: **0.3900 → 0.3450 s/step (−11.54%)**, gap 9.0x the spread,
+   `WORTH: yes`, peak 11.24 → 10.31 GB; card (G-m8probe v3): **1.135 → 0.750 s/step (−33.9%)**, spread 0.000. Harmless:
+   default and exact+toggle `BITEXACT: yes` (exact mode ignores the toggle and says so); M6.1 with the toggle max |dp|
+   **0.0059** of the 0.05 gate, argmax 160/160; M6.2 exact PASS with a byte-identical trace; M6.2 **TF32** misses the
+   1e-3 early gate on 3 of 5 steps (baseline 1), all 20 inside 1e-2 — the recorded cost of an 8-bit activation mantissa.
+   Full-arm gate (G-m8arm, gpubox): both CE gates hold (dev |Δ| **0.00326** of 0.01, test |Δ| **0.00830** of 0.02);
+   4/15 `score.py` metrics outside `arm.sh`'s Python-only band, all borderline th0.5 cards in one direction, no lost
+   positive — the non-BF16 TF32 arm misses the same `th0.5.precision`, so the record's verdict is **ACCEPT** (the
+   four-run band of D§10.3.3 is the as-built definition). Toggle: **`JT_BF16_WEIGHTS`**, default **1 in TF32 mode**
+   (set by `main.c`'s `m8_defaults()`, which prints `jefftrain: default JT_BF16_WEIGHTS=1 …`), `=0` restores fp32,
+   never set under `JT_EXACT`.
+2. **Chunked GDN — built, OPT-IN, default off** (`JT_GDN_CHUNKED=1`; J37). The WY form is real (7 GEMMs + a 64×64
+   unit-triangular inverse per chunk fwd, 16 + 7 bwd) and correct (worst rel **1.58e-06** vs the 1e-4 gate), but not
+   faster: gpubox **+5.2% per step** (the backward is 1.3–1.55x faster, the forward 3.1–3.3x slower, and ~22,000 extra
+   launches per step cost the rest; the 1e-4 gate rules out TF32 for these GEMMs, so they run `COMPUTE_32F` at 5–7
+   TFLOPS). Card (G-m8probe v5): **+18.5%**, and the sanity check failed — two defects, both fixed by the first J51
+   card: `gdn_chunk_trinv_kernel` never wrote T's strictly-upper triangle (invisible on gpubox's zeroed allocator,
+   leftover-amplified on the shim), and libtinycublas ran every f32 GEMM on TF32 whatever the compute type said. After
+   the fixes the card gate is green (`chunked_vs_sequential` ~1e-6 on all five shapes, `test_gemm` 129/129 TF32 and
+   exact; `logs/jefftrain/G-m8gdn-card.md`), but the speed verdict does not move: no `WORTH` on either backend, so no
+   default. Both implementations stay in the tree, exercised by `test_gdn` in every run.
+3. **Fused kernels — NOT LANDED, by measurement.** J38 priced all three pieces before building: norm+cast ≤0.1% of a
+   step and silu_mul prologue ~0.3% (both predicated on item 1's cast, and pure memory questions), and found the real
+   cost was the transposes (7.4% TF32 / 15.8% exact) — fixed by J44 instead. After J44, J48 re-profiled: the attention
+   core (scores + softmax + PV + backward, transposes excluded) is **2.71% of a TF32 step / 5.24% exact**, below the
+   4% threshold a flash rewrite would need, so J49 (CPU reference) and J50 (kernel) both skipped: `DECISION: NOT
+   LANDED`, nothing built, nothing to remove. The profiling scaffolding is parked in **`notes/J38.wip.patch`**
+   (`JT_PROF`, `JT_NOATTN`, `JT_NOTR`, `JT_NOSM`, `JT_NOSMZ`) and its post-J45 port in **`notes/J48.wip.patch`** —
+   measurement instrumentation, not proposals.
+4. **No recompute — LANDED, automatic when the whole run's footprint fits** (J39 built it, J51 made it the default).
+   `--no-recompute` / `JT_NO_RECOMPUTE=1` keeps every layer's forward saves in a **store** appended to the arena in the
+   same `cudaMalloc` (**3,172.55 KB per packed token** + 18 GDN checkpoint slots + one shared work region), so the
+   backward re-runs nothing. Bit-identical, not merely inside the gates: the 20-step trace and the 403-key
+   `--dump-backward` dump are byte-identical to the recompute path's (J39; re-gated after the store's `dy`-width fix,
+   the second J52 card). Speed: J39 **1.127 → 0.778 s/step (−31%)** at batch 8 × accum 1 (the plan's −25% estimate was
+   conservative), peak 7.84 → 29.56 GB; J51 re-measured **0.470 → 0.345 (−26.6%)** with four byte-identical traces.
+   J51's auto rule (`store_auto_mode()`): with the toggle **unset**, the store engages when *everything the run still
+   has on the device* — arena+store, GDN checkpoints, backward scratch, main.c's step buffers — plus a **1 GB margin**
+   fits; free memory comes from `cudaMemGetInfo` on real CUDA (the driver over-commits, so a probe allocation lies:
+   one early version admitted a 32.6 GB footprint on a 31.84 GB card and the step went 0.475 → **28.84 s/step**) and
+   from a probe `cudaMalloc` on the shim (its `cudaMemGetInfo` returns the card's total). `JT_NO_RECOMPUTE=0` forces
+   recompute, `=1` forces the store even where memory says no; `--eval-only`/`--dump-forward` never allocate a store.
+   Startup lines: `ctx: no-recompute (auto): …` / `ctx: recompute (auto): …` with both numbers. On gpubox's 32 GB the
+   timing shape fits and the store is on; on the 24 GB card at batch 8 it does not (30.17 GB wanted vs 23.69 free),
+   so the card's default is recompute. Diagnostic: **`JT_NO_RECOMPUTE_GUARD=<KB>`** (default off) poisons and checks
+   that many KB above the store's work region after every piece — it is what named the `GdnBwd.dy` width bug.
+5. **Launch batching — REMOVED** (J40 built and parked it, J45 re-measured it behind `JT_ATTN_BATCH=<cap>`, J51
+   removed it). The chunked layout passes cut a batch-8 run's launches **7,953 → 6,189 (−22.2%)** and were
+   `BITEXACT: yes` at every cap — but `WORTH: no` on **both** backends: gpubox −2.56% TF32 / −2.11% exact at cap 4096
+   (5 pairs, gaps 0.7x / 0.4x the spread), card (G-m8probe v2) **0.0%** (107,404 → 83,740 launches, median unchanged).
+   The card does not gain from fewer launches: J40's bound from `launch_copy_bench`'s header (11–95 µs/launch,
+   ~3,500 launches/step) was 0.1–0.8% of a shim step, and the measurement came in at the bottom of it. The removal's
+   diff is **`notes/J51-JT_ATTN_BATCH.patch`** (checked in both directions; applying it in reverse restores the
+   feature); the original pre-toggle change is **`notes/J40.wip.patch`**. `launch_copy_bench` itself was never run on
+   the card (G-m8probe stopped before variant 7).
+
+**A run shape, not a default:** batch 4 × accum 2 did **not** qualify — gpubox 1.248 vs 1.127 s/step, card (G-m8probe
+6a) 0.0% in seconds per 8 rows — so it stays a run setting and is **not** in any arm command. Its one contribution was
+finding the store's `dy`-width bug (6b faulted 3/3; fixed by the second J52 card, after which the card's batch-4 store
+run completes: 20 steps, exit 0, store and recompute traces byte-identical).
+
+**Final speed (G-m8final, before = the pre-batch tree `2456ab5`, after = today's defaults, TF32, 20 steps, 3
+interleaved pairs, spreads 0.000):**
+
+| machine | before | after | Δ | full arm (3,581 steps) | peak |
+|---|---:|---:|---:|---:|---|
+| card B (4090, shim) | 1.645 s/step | **0.760 s/step** | **−53.8%** | 98.2 → **45.4 min** | 8.91 → 7.92 GB |
+| gpubox (5090, nv) | 1.0150 s/step | **0.353 s/step** | **−65.2%** | 60.6 → **21.1 min** | 11.24 → 10.40 GB |
+
+On gpubox the after-run has the store on (it fits); on the card it is the recompute path with bf16 weights (the store
+does not fit at batch 8), so the card's −53.8% is transposes + bf16 only. Sanity: step-20 loss 1.3226 → 1.3224,
+dev CE 0.7712 → 0.7693, argmax agreement unchanged. The full-split instrument (`timing.sh`) reads **0.353 s/step**
+(22.7 rows/s, 2.47x PyTorch's 0.143, inside D§15's 0.4 target) where v1 read 1.061.
 
 ---
 
@@ -954,6 +1074,9 @@ In expected order of payoff:
 | gradient parity fails only in TF32 | the sweep amplifies a 1e-6 relative perturbation by ~1e21 over 24 layers (M5.1); every gradient gate and M6.2/M7.3 runs in exact mode |
 | a `.jtb` is right but jefftrain rejects its own flags | the batch/short-batch shape is prep.py's shuffled order plus `<split>.prep.json`'s `rows_per_batch`, not "full batches first" (M5.2) |
 | a weight buffer reads back as zeros right after the load | `ctx->stream` is `cudaStreamNonBlocking` (D§12 forbids `cudaStreamCreate`) and this driver does not order the null stream against it; `jt_ctx_alloc` ends with one device-wide barrier, and anything uploaded or read back after that must use `ctx->stream` (J18) |
+| card takes `Graphics SM Warp Exception … Illegal Instruction Encoding`, `cuBLAS error 13` in `gemm.c` | the binary was built `ARCH=sm_89` **without `SHIM=…/shim-sm_89`**, so it linked the 5090 shim's cubins (G-m8final). `test-null` and `check-symbols` pass either way — they do not look at cubin arch. Relink against the card's own shim; the next open resets the card |
+| a worktree-built shim dies in `cudaMalloc` at boot, before any kernel | the shim bakes `TINYNV_FW_DEFAULT_DIR` to the build tree's git-ignored (empty) `libtinynv/third_party/firmware`; a worktree rebuild has no firmware there. `TINYNV_FW_DIR` is the documented override (J51's card gate) |
+| the no-recompute store faults the card with an MMU fault that names no kernel | a piece wrote past the store's top buffer — the work region's end is the allocation's end. `JT_NO_RECOMPUTE_GUARD=<KB>` poisons and checks above it after every piece and names the layer, piece and span (it found `GdnBwd.dy` budgeted at 1024 not 2048 floats/token, fixed by the second J52 card) |
 
 ## Appendix B. Done-ness checklist (copy into the final change description)
 
@@ -986,8 +1109,25 @@ Every number below is measured; the note in `train/jeff/notes/` that carries it 
       11.33 / 12.29 GB; run parity **PASS**, 15/15 metrics inside the four-run band, dev CE |Δ| 0.00072 / 0.00607,
       calibrated test CE |Δ| 0.00130 / 0.01170, arm wall 75.5 / 76 min [J32, J33, G-m63, G-m64]
 - [x] M7 shim: eval parity vs gpubox, max dp **0.0011** (argmax 160/160); 20-step parity worst **1.17e-03**, dev |d|
-      2.70e-04, and **5.44e-05** per row against the gpubox binary; (optional) full arm s/step **not run** — at 8.94 s/step
-      it is ~9 h on the card [J35, G-m72, G-m73]
+      2.70e-04, and **5.44e-05** per row against the gpubox binary; full arm **run** (G-m74): three arms at
+      **1.675 / 1.708 / 1.675 s/step**, **1 h 57 min** each, peak **~9.84 GB of 24 GB** (allocated sum, not sampled);
+      dev CE |Δ| **0.00185** (gate 0.01), calibrated test CE |Δ| **0.00370** (gate 0.02), **15/15** metrics inside the
+      four-run band with the count floor at 2 and the B = 0 start [J35, G-m72, G-m73, G-m74]
+- [x] M8 speed, decided by measurement (J51's table): J44 transposes TF32 **1.0150 → 0.3900 s/step (−61.58%)**, exact
+      **1.1050 → 0.4750 (−57.01%)**, `BITEXACT: yes`; bf16 frozen weights (J46/J47/J51) **the TF32 default** — gpubox
+      **−11.54%** (`WORTH: yes`, gap 9.0x spread), card **−33.9%**, weights 1.99 → 1.00 GB, M6.1 with the toggle 0.0059
+      of the 0.05 gate, G-m8arm's CE gates 0.00326/0.00830 (ACCEPT; 4/15 vs the Python-only band, see M8); no-recompute
+      store (J39/J51) **automatic when the footprint fits** — **−31%** (J39) / **−26.6%** (J51), 3,172.55 KB/token,
+      traces and 403-key dump byte-identical; chunked GDN (J37) opt-in, default off (+5.2% gpubox, +18.5% card; the
+      card's two defects fixed, gate ~1e-6); flash attention NOT LANDED (J48's ceiling **2.71% TF32 / 5.24% exact**,
+      J49/J50 skipped); launch batching removed (J45/J51, `WORTH: no` on both backends, −22.2% launches bought 0.0% on
+      the card; `notes/J51-JT_ATTN_BATCH.patch`) [J36–J51, G-m8probe, G-m8arm]
+- [x] M8 final speed (G-m8final, TF32, 3 interleaved pairs, spreads 0.000): card B **1.645 → 0.760 s/step (−53.8%)**,
+      peak 8.91 → 7.92 GB, full arm 98.2 → **45.4 min** (recompute path: the store wants 30.17 GB vs 23.69 free at
+      batch 8); gpubox **1.0150 → 0.353 s/step (−65.2%)**, peak 11.24 → 10.40 GB, full arm 60.6 → **21.1 min** (store
+      on); `timing.sh` full split **0.353 s/step**, 2.47x PyTorch, inside D§15's 0.4 target; sanity step-20 loss
+      1.3226 → 1.3224 [G-m8final]
 
 One open follow-up the notes name and this plan does not own: `scripts/arm.sh`'s metric band still contains only the
-Python runs, so M6.4's four-run table is not reproducible from the script alone (G-m64).
+Python runs, so M6.4's four-run table is not reproducible from the script alone (G-m64; G-m8arm's ACCEPT records the
+same defect against the BF16 arm).

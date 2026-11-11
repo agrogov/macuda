@@ -1,9 +1,12 @@
 # jefftrain: a C/CUDA LoRA trainer for Jeff on the macuda shim. Design
 
-Status: implemented and corrected against the built tree. Companion: `jeff-trainer-plan.md` (the step-by-step coding
+Status: implemented and corrected against the built tree, through the M8 speed batch (J36–J51, card records
+G-m74/G-m8probe/G-m8arm/G-m8final). Companion: `jeff-trainer-plan.md` (the step-by-step coding
 plan with test gates; its Appendix B carries the measured numbers). Written 2026-11-08; the sections marked
 *as built* below were reconciled with `train/jeff/` and its `notes/` afterwards, because several of the original
-estimates (the GDN backward's cost, the `.jtb` header's contents, the TF32 gate) did not survive contact.
+estimates (the GDN backward's cost, the `.jtb` header's contents, the TF32 gate) did not survive contact. Defaults
+that changed in M8 (bf16 frozen weights in TF32, the automatic no-recompute store) are marked where they live; exact
+mode is unchanged and remains the oracle.
 
 ## 1. What this is and why
 
@@ -388,6 +391,19 @@ Implementation: `cublasGemmEx(h, tb?T:N, ta?T:N, N, M, K, &alpha, B, CUDA_R_32F,
 COMPUTE is `CUBLAS_COMPUTE_32F_FAST_TF32` by default and `CUBLAS_COMPUTE_32F` when built with `-DJT_EXACT=1` or run with `JT_EXACT=1` in the environment, as the shim checkpoints do (for
 gradchecks). libtinycublas accepts both for fp32 A/B (cublas.c's type contract; `test/cublas_contract.c` checks it).
 On the shim, `TINYCUBLAS_TC=0` in the environment additionally forces the non-tensor-core path; use it for gradchecks.
+*As built since the first J51 card, the shim honours the compute type*: an f32 GEMM takes the TF32 tensor-core kernel
+only for a `*_FAST_*` compute type or a handle in `CUBLAS_TF32_TENSOR_OP_MATH`; plain `COMPUTE_32F` takes the exact
+fp32 scalar kernel (before, every f32 GEMM ran TF32 regardless, which is what made the chunked GDN path wrong on the
+card while gpubox was right). So `JT_EXACT=1` alone now means exact on both machines — card `test_gemm` worst f32 rel
+3.07e-06 with `JT_EXACT=1`, matching the `TINYCUBLAS_TC=0` recipe to three significant figures; every recorded exact
+recipe already set both, so no recorded number changed meaning.
+
+*As built since J47/J51 there is a second wrapper pair for the frozen-weight GEMMs*: `gemm_bf16_ok()` (the alignment
+rule below, in this wrapper's terms: each operand's row length a multiple of 8 elements, both bases 16-byte aligned)
+and `gemm_bf16()` — `cublasGemmEx` with `CUDA_R_16BF` A and B, fp32 C, `CUBLAS_COMPUTE_32F`, used by `y = x W^T` and
+`dx = dy W` when the weights are kept bf16 (6.1). A shape that fails the rule is widened back to fp32 and takes
+`gemm()`; it is never silently run on another kernel. `test_gemm` gates it at 129/129 in both modes (the bf16 cases
+against a CPU reference on bf16-rounded inputs, worst rel 1.4e-06 at the real MLP shape).
 
 Per layer, with N = total tokens in the batch (about 4200 for 8 rows):
 
@@ -414,7 +430,8 @@ or call the batched GEMM twice with stride 0 tricks (not needed).
 
 ### 6.1 v1 precision (the one to build first)
 
-* Frozen weights: converted from bf16 to fp32 once at load, kept on the card in fp32. Non-embedding text weights
+* Frozen weights: converted from bf16 to fp32 once at load, kept on the card in fp32 (v1; as built since J51 the TF32
+  default keeps them bf16 — see the as-built paragraph at the end of this section). Non-embedding text weights
   are about 0.5 B parameters = about 2.0 GB fp32. The embedding table stays bf16 (508 MB) and is gathered with a
   bf16→fp32 conversion kernel.
 * Activations, gradients, LoRA factors, readout, Adam state: fp32.
@@ -439,6 +456,20 @@ dump gives `87 ok, 316 failed`). A 1e-4-level difference between jefftrain and a
 in exact mode; TF32 is what M6.3's timing, M6.4's arm and the card checkpoints' m1/m2/m3 steps use, and gradient
 clipping and Adam inherit the noise if a training run is done in it.
 
+**As built since J51, the frozen weights are bf16 by default in TF32 mode** (M8 item 1: J36 → J46 → J47 → J51).
+`JT_BF16_WEIGHTS=1` — set by `main.c`'s `m8_defaults()` when the mode is TF32 and the variable is unset, with the
+startup line `jefftrain: default JT_BF16_WEIGHTS=1 …` — keeps every frozen Linear weight in the checkpoint's own bf16
+bits (`Linear.Wb`; all 473 tensors are BF16 on disk, so nothing is rounded at load and the fp32 copy is never
+allocated: weights **1.99 → 1.00 GB**). The two frozen-W GEMMs take bf16 operands (5's `gemm_bf16`), the activation
+operand cast per call by `jt_f32_to_bf16_n`; activations, gradients, LoRA, readout and Adam stay fp32. Measured:
+gpubox **−11.54% s/step** (`WORTH: yes`), card **−33.9%**, peak 11.24 → 10.31 GB; M6.1 with the toggle max |dp| 0.0059
+of the 0.05 gate, argmax 160/160; the full-arm CE gates hold (G-m8arm: dev |Δ| 0.00326, test |Δ| 0.00830). The only
+recorded regression is M6.2 in TF32 (3 of 5 early steps miss 1e-3 where the TF32 baseline misses 1; all 20 inside
+1e-2) — the 8-bit activation mantissa's cost, in the mode that is already noise by construction. `JT_BF16_WEIGHTS=0`
+restores the fp32 path byte for byte, and **exact mode never takes the default**: under `JT_EXACT=1` the toggle is
+ignored with a `weights: bf16 ignored …` line, so every exact gate and trace stays bit-reproducible. Exact mode
+remains the oracle.
+
 ### 6.2 Memory plan (target: fits a 12 GB card)
 
 Layer-level recompute (the same thing as `--grad-checkpoint`): the forward keeps only each layer's input x (fp32
@@ -458,6 +489,25 @@ forward from its saved input into scratch, then runs its backward. Cost: one ext
 Total about 7 GB at batch 8 in the worst case (8 rows of 1000 tokens), about 5 GB at typical lengths. If memory is short, lower the batch or the segment length. Never call cudaMalloc inside
 the step loop: allocate everything once at start-up, sized for the largest batch in the batch file (`max_tokens` from
 its header, section 9), and reuse.
+
+**As built since J39/J51, recompute is not always the mode.** `--no-recompute` (`JT_NO_RECOMPUTE=1`) keeps every
+layer's forward saves in a **store** appended to the arena in the same `cudaMalloc` — 24 layers' saves and post-mixer
+residuals (**3,172.55 KB per packed token**, widths pinned by `_Static_assert` and re-checked after every SAVE pass),
+18 GDN checkpoint slots and one shared work region — so the backward re-runs nothing: one forward less per step,
+**−31%** at batch 8 × accum 1 on gpubox (J39), at peak 7.84 → 29.56 GB. It is bit-identical to the recompute path (the
+20-step trace and the 403-key backward dump are byte-identical files), so J51 made it **automatic when it fits**:
+with the toggle unset, `store_auto_mode()` engages the store when the whole run's device footprint — arena+store,
+GDN checkpoints, backward scratch, main.c's step buffers — plus a 1 GB margin fits in free memory
+(`cudaMemGetInfo` on real CUDA, a probe `cudaMalloc` on the shim, each for measured reasons: the nv driver
+over-commits probes, the shim's `cudaMemGetInfo` returns the card's total). The store is sized for the **train**
+split's widest batch (`JT_NO_RECOMPUTE_TOKENS`, set by main.c only when a backward will read it); a wider batch — a
+dev check's, typically — takes the recompute path in both sweeps. `JT_NO_RECOMPUTE=0` forces recompute everywhere,
+`=1` forces the store even where memory says no; `--eval-only`/`--dump-forward` allocate no store. The startup line
+says which way it went and why (`ctx: no-recompute (auto): …` / `ctx: recompute (auto): …` with both numbers). In
+practice: gpubox's 32 GB runs the timing shape with the store on (0.353 s/step, G-m8final); the 24 GB card at batch 8
+refuses it (30.17 GB wanted vs 23.69 free) and recomputes. `JT_NO_RECOMPUTE_GUARD=<KB>` (diagnostic, default off)
+poisons and checks that many KB above the store's work region after every piece — the tool that named the
+`GdnBwd.dy` width bug when the store put that buffer at the very end of the allocation.
 
 ## 7. Packed batches (no padding)
 
@@ -498,6 +548,7 @@ cudaMemcpyToSymbol in the shim; pass tables as pointers).
 |---|---|---|
 | embed_gather | out[t,:] = float(bf16 table[id[t],:]) | grid N, block 256 |
 | bf16_to_f32 | weight conversion at load (as built: `jt_bf16_to_f32_n`, `_n` because the test harness owns a scalar `jt_bf16_to_f32`) | 1-D grid-stride |
+| f32_to_bf16 | the bf16 weight mode's activation-operand cast (J46: `jt_f32_to_bf16_n`, round-to-nearest-even on the integer bits — sm_120's `cvt.rn.bf16.f32` returns 0x7fff for every NaN, so the hardware instruction is not bit-reproducible; `ref_f32_to_bf16` is the oracle, 13 bit-equal checks) | 1-D grid-stride |
 | rmsnorm_fwd(d, zero_centred) | y and r per row (r saved) | one block per row for d > 256; one warp per row for d ≤ 256 (q_norm/k_norm) |
 | rmsnorm_bwd | 4.3 (**one** row reduction, `mean(gy*x)`: `r` is taken as an input, not recomputed) | one block per row |
 | gated_rmsnorm_fwd/bwd | 4.4, rows = N x 16 heads, d = 128 | one warp per row, 8 warps (256 threads) per block, grid = ceil(rows/8) |
@@ -515,10 +566,15 @@ cudaMemcpyToSymbol in the shim; pass tables as pointers).
 | adamw_step | 2.2, one launch over a flat parameter buffer with a per-element lr group | grid-stride |
 | sumsq | for the global grad norm: `sumsq_partial` + `sumsq_final` over a fixed 1024 blocks (deterministic); returns the **sum of squares**, the caller takes the root | |
 
-The row-structured ops (`qgate_*`, `kv_*`, `to/from_head_major`) launch one block per row (or per head) *strided over
+The row-structured ops (`qgate_*`, `kv_reduce`) launch one block per row (or per head) *strided over
 rows* rather than as a flat grid-stride: inside a row the block walks heads and columns with `for` loops, so no thread
 divides an index and a large packed batch cannot overrun the grid's x limit. Every wrapper is a no-op for a zero
-dimension, so no caller special-cases an empty slice.
+dimension, so no caller special-cases an empty slice. **Exception, as built since J44:** `jt_to_head_major`,
+`jt_from_head_major` and `jt_kv_expand` launch one block per (head, **16-token tile**, `JT_MISC_TILE`) — tiles on the
+grid's x axis, heads on y. The one-block-per-head shape ran **8 blocks for the whole GPU** and cost 7.4% of a TF32
+step / 15.8% of an exact one (J38's ablation); tiling them cut TF32 1.0150 → 0.3900 s/step and exact 1.1050 → 0.4750
+(J44, `WORTH: yes` both, `BITEXACT: yes` — they are pure copies, every element copied from the same input element).
+`kv_reduce` sums, so its order is unchanged.
 
 Keep all LoRA A, B and the readout in ONE flat fp32 buffer (and grads, m, v in three more of the same layout), with a
 host-side table of offsets. That makes zeroing, the grad norm, clipping and Adam each one launch, and saving a flat
@@ -545,6 +601,13 @@ dK[h] = dSc[h]^T Q[h]                        gemm_batched(1,0)
 ```
 P is kept from the forward of the same (recomputed) layer. Buffers are sized for the longest row and reused row by row.
 Then dK, dV go through kv_reduce (sum of 4 heads per group) into [L,512].
+
+*As built after M8, this per-row structure is still the default and the whole of it.* J44 tiled the layout transposes
+(8.1), which cut the step by ~60%; J48 then re-measured the attention core (scores + softmax + PV + backward,
+transposes excluded) at **2.71% of a TF32 step / 5.24% exact** — below the 4% threshold, so the flash-style rewrite
+was not built (J49/J50 skipped; 4.7's "no flash attention needed at this L" stands measured). J45's chunked launch
+batching (`JT_ATTN_BATCH`) was bit-identical and cut 22.2% of launches but was `WORTH: no` on both backends (0.0% on
+the card), so J51 removed it; the per-row launches above are what runs.
 
 ### 8.3 GDN recurrence: the one hard kernel
 
@@ -636,11 +699,24 @@ peak; a plain copy reaches ~85%); a 4090 gives a 13.0 ms floor and 15.99 ms (81%
 token can meet 2 ms — 10.7 GB in 0.7 ms would need 15 TB/s — so the next 4x is either keeping a segment's `sp`
 resident (8 tokens is 128 KB per block, 64 MB across 512 blocks in L2) or a rolling shared-memory window replayed from
 the checkpoint per chunk (~25% more phase A work). Both change this section's `sp[tl][64][128][32]` layout, which is
-why v1 did not do it; it is M8's chunked GDN, with `gdn_bwd_sp_floats()`/`gdn_bwd_part_floats()` in
+why v1 did not do it; it was left to M8, with `gdn_bwd_sp_floats()`/`gdn_bwd_part_floats()` in
 `kernels/gdn.h` the only place a buffer size is written down. Memory for it: 1.99 GB of backward scratch at B = 8 /
 N = 5094 (ckpt 142.6 MB + `sp` 512 MB + two 668 MB partials + gates 1.3 MB each).
 
-The fla chunked algorithm (WY form, GEMM-based) is faster and is the M8 optimisation. It does not belong in v1.
+**The fla chunked algorithm (WY form, GEMM-based) — built (J37), measured, and not the win this paragraph predicted.**
+It lives in `kernels/gdn.cu` behind **`JT_GDN_CHUNKED=1`, default off**, both implementations kept and exercised by
+`test_gdn` in every run. The form is correct (worst rel 1.58e-06 against the 1e-4 gate; a double-precision prototype
+validated the math before any CUDA): a chunk of 64 tokens is 7 GEMMs plus one 64×64 unit-lower-triangular inverse
+forward, 16 + 7 backward. But the 1e-4 gate rules out TF32 for these GEMMs, so they run `CUBLAS_COMPUTE_32F` at 5–7
+TFLOPS, and the chunk turns an O(1) per-token recurrence into O(C) intra-chunk work: the backward is genuinely
+1.3–1.55x faster, the forward is 3.1–3.3x **slower**, and the ~22,000 extra launches per training step make the trainer
+**+5.2% per step on gpubox** and **+18.5% on the card** (G-m8probe v5). "GEMMs are the shim's strong path" did not
+rescue it. The card also exposed two defects gpubox could not see, both fixed (the first J51 card): the chunk
+T-inverse never wrote its strictly-upper triangle (a zeroed allocator hid the read on gpubox; recycled video memory
+amplified it to 0.14 on the shim), and libtinycublas ran every f32 GEMM on TF32 whatever the compute type said (5's
+as-built note). After the fixes the card gate is green — `chunked_vs_sequential` ~1e-6 on all five shapes with the
+arena prefilled 0x7f, `test_gemm` 129/129 in both modes — but the speed verdict stands: opt-in, off, no default. The
+`sp`-resident / rolling-window redesign above remains the unbuilt alternative.
 
 ## 9. Data in, results out
 
@@ -785,6 +861,17 @@ Measured (section 10.3, all three): eval max |dp| 0.0014 TF32 / 0.0015 exact wit
 step-mean difference 1.18e-03 at step 7 and dev soft CE within 2.70e-04; run parity PASS, 15/15 metrics inside the
 four-run band with both CE gates at 0.00072/0.00130 (seed 0) and 0.00607/0.01170 (seed 1).
 
+**The M8 arm (G-m8arm, `JT_BF16_WEIGHTS=1`, TF32, gpubox):** both CE gates hold — dev |Δ| **0.00326** of 0.01, test |Δ|
+**0.00830** of 0.02, 0.378 s/step, peak 11.36 GB — but 4 of 15 `score.py` metrics fall outside `arm.sh`'s Python-only
+band (`th0.5` precision/F1/maybe_cards/fp), all in one direction (fewer positive/maybe predictions at 0.5), no lost
+positive: recall 1.000, tp 29/29, argmax agreement 0.931/0.931 and every th0.9 metric identical. The record's verdict
+is **ACCEPT**, for measured reasons: the disputed cards sit at P(positive) 0.3–0.7 and swing as much between the two
+Python seeds, and the *non-BF16* TF32 jefftrain arm misses the same `th0.5.precision` against the same band — the band
+is narrower than the real run-to-run spread, which is why the four-run definition above exists. Since G-m74 the
+band's count metrics carry a floor of **2** test lines (the user's decision, 2026-11-10: a 1-line floor demanded
+agreement to the last card on metrics whose own thresholds have more slack than that). The band-in-arm.sh follow-up
+is still open.
+
 ### 10.4 On the shim (Mac + eGPU)
 
 Same binary source, linked against the shim. Each piece goes to the card soon after it passes on gpubox: the GEMMs, the
@@ -795,7 +882,13 @@ difference). Then one full arm, timed.
 
 Measured on card B (RTX 4090, `ARCH=sm_89`, shim): eval parity **max |dp| 0.0011** against gpubox jefftrain (9x inside
 the 0.01 gate), argmax 160/160; 20-step parity worst **1.17e-03** (gate 1e-2) and **5.44e-05** per row against the
-gpubox binary; the full arm was not run — at 8.94 s/step it is ~9 h on the card. The layer-level checkpoint numbers are
+gpubox binary. The full arm **ran** (G-m74): three arms, **1.675 / 1.708 / 1.675 s/step** TF32, **1 h 57 min** each,
+peak **~9.84 GB of 24 GB** (the sum of the start-up allocations; the shim's memory query gives no sampled peak);
+dev CE |Δ| **0.00185**, calibrated test CE |Δ| **0.00370**, **15/15** metrics inside the four-run band — with the
+B = 0 start (train.py's, not make_adapter.py's random B) and the count floor at 2 (10.3.3). The earlier "~9 h at
+8.94 s/step" estimate was wrong: 8.94 is the exact fp32 kernel, which the arm never uses — TF32 measured 1.67 s/step
+on the same 20 batches (5.34x). After M8 the same 20-batch shape runs at **0.760 s/step** (G-m8final, −53.8% against
+the pre-M8 tree). The layer-level checkpoint numbers are
 2-7x the gpubox ones (m4 `final` 4.572e-06 vs 2.104e-06, m5 worst 2.345e-05 vs 1.205e-05), i.e. a different
 summation order, not a layout error.
 
@@ -898,10 +991,11 @@ From `nm` on `build/shim-sm_89/libtinycudart.a` and `libtinycublas.a`, 2026-11-0
   cublasGemmStridedBatchedEx, cublasSgemm_v2, cublasSgemmBatched, cublasSgemmStridedBatched, cublasStrsmBatched.
   jefftrain uses only cublasGemmEx and cublasGemmStridedBatchedEx for math. Plan M1.2a checks that the strided-batched
   entry point accepts COMPUTE_32F_FAST_TF32 with fp32 A/B/C on the shim, as GemmEx does — and it does: card B's m1
-  checkpoint printed `GEMM OK 112/112` in both modes with no `NOT_SUPPORTED`. As built the whole tree needs **24**
+  checkpoint printed `GEMM OK 112/112` in both modes with no `NOT_SUPPORTED`. As built the whole tree needs **25**
   cuda*/cublas* symbols (`make check-symbols`), all defined by the shim archives: the count grew from 10 at M0 to 15 at
-  M1 (the five cuBLAS entries), 17 at M2.6 (`_cudaMemsetAsync`, `_cudaMemGetInfo`), and 23 by M4.3–M5, with 24 after
-  `--trace-loss`'s host pulls. Nothing in `src/` or `kernels/` had to move to a different API to get there.
+  M1 (the five cuBLAS entries), 17 at M2.6 (`_cudaMemsetAsync`, `_cudaMemGetInfo`), 23 by M4.3–M5, 24 after
+  `--trace-loss`'s host pulls, and 25 at J51 (the auto-store's refused probe `cudaMalloc` reads `cudaGetLastError`).
+  Nothing in `src/` or `kernels/` had to move to a different API to get there.
 
 **Missing, do not use:** cudaLaunchKernel, cudaStreamCreate, cudaEventCreate, cudaEventElapsedTime (time on the host
 with `clock_gettime(CLOCK_MONOTONIC)` after `cudaDeviceSynchronize`), cudaMemcpyToSymbol, cudaMallocAsync,
@@ -918,9 +1012,11 @@ train/jeff/
   README.md                how to build and run, pointing here
   src/
     main.c                 flags (train.py's names), the training loop, the dev check, eval, report.json,
-                           --dump-forward/--dump-backward, --trace-loss
-    model.c / model.h      the loader (every tensor through st_get into one fp32 arena), jt_batch_set,
-                           jt_ctx_alloc/free, layer_fwd/layer_bwd, model_forward, model_backward (section 6.2's sweep)
+                           --dump-forward/--dump-backward, --trace-loss, m8_defaults() (the one place an M8 default
+                           lives, per-backend, TF32 only)
+    model.c / model.h      the loader (every tensor through st_get into one fp32 arena, plus a bf16 weight arena when
+                           JT_BF16_WEIGHTS is on, section 6.1), jt_batch_set, jt_ctx_alloc/free (the auto no-recompute
+                           store, section 6.2), layer_fwd/layer_bwd, model_forward, model_backward (6.2's sweep)
     model_table.c / .h     the model as data: per-layer names/shapes/LoRA flags, the 150 adapted linears in
                            flat-buffer order, config constants (section 3.2's list, as data)
     linear.c / linear.h    the frozen `struct Linear` and linear_fwd/linear_bwd (section 4.2/5)
@@ -954,7 +1050,7 @@ train/jeff/
     compare_steps.py       trace_train_loss.py's output vs --trace-loss, with the M6.2 gate
   scripts/
     gpubox-sync.sh  gpubox-build.sh  gpubox-run.sh  prereq-check.sh  card-check.sh
-    parity-eval.sh  parity-steps.sh  timing.sh  arm.sh
+    parity-eval.sh  parity-steps.sh  timing.sh  arm.sh  ab.sh (the M8 A/B timer: WORTH / BITEXACT verdicts)
   notes/                   one <task>.md per step, first line STATUS: PASS or STATUS: BLOCKED — … (plan rule 9)
 ```
 
@@ -963,8 +1059,9 @@ layer, the safetensors names it loads and whether each linear has LoRA. Section 
 translation unit rather than a part of `model.c` because `src/lora.c` needs it before `model.c` exists; `model.c` is the
 loader that consumes it and verifies every name and dimension against the checkpoint.
 
-`struct Linear { const float *W; int in, out; int lora; size_t a_off, b_off; const char *stem; }`: `lora` set means
-`a_off`/`b_off` index the flat parameter buffer. `linear_fwd(ctx, &lin, x, N, y, u_save)` and
+`struct Linear { const float *W; const unsigned short *Wb; int in, out; int lora; size_t a_off, b_off; const char *stem; }`:
+`lora` set means `a_off`/`b_off` index the flat parameter buffer; `Wb != NULL` (J47) means the frozen weight lives in
+the bf16 arena and `W` is then a shared 8-word marker, never a weight (6.1's bf16 mode). `linear_fwd(ctx, &lin, x, N, y, u_save)` and
 `linear_bwd(ctx, &lin, x, u, dy, N, dx, accumulate_dx)` are the only functions that touch W, A or B. Every layer
 calls them. Two caveats found in use: `linear_fwd`/`linear_bwd` return `JT_LAYER_FAIL` (never `exit()`) on a bad call,
 and `stem` must outlive the load — it once pointed into a pool `model_load` freed, which prints `?` in messages and
@@ -976,12 +1073,12 @@ breaks any lookup keyed on it.
 |---|---|
 | a backward formula is wrong | gradcheck per kernel (double precision CPU ref) and per layer (fp32 GPU vs finite differences) before end-to-end |
 | layout mistake (q/gate interleave, conv taps, head order) | dump_ref.py layer-by-layer parity on real weights pinpoints the first layer and tensor that diverges |
-| GDN kernel too slow on the shim | v1's real cost is 12.9 ms/layer on gpubox and 17.3 ms on the card, memory-bound on section 8.3's `sp` scratch (not the estimate this row originally carried); the chunked WY form and a resident/rolling `sp` window are M8 |
+| GDN kernel too slow on the shim | v1's real cost is 12.9 ms/layer on gpubox and 17.3 ms on the card, memory-bound on section 8.3's `sp` scratch (not the estimate this row originally carried); the chunked WY form was built and measured (J37): +5.2%/step gpubox, +18.5% card, opt-in and off (8.3's closing paragraph); a resident/rolling `sp` window remains unbuilt |
 | shim lacks an API | section 12 plus `make check-symbols` before anything runs |
 | strided-batched TF32 rejected, or a GDN kernel misbehaves on the shim | found by the card checkpoints at Plan M1.2a and M3.2a, before the code that depends on them is written |
 | tinycublas TF32 numerics differ from cuBLAS | the gate is against the exact build; TF32 runs are compared run-to-run only |
 | the batch order differs from Python | prep.py reuses train.py's own functions; the M5 test compares batch lists |
-| memory on a 12 GB card | layer recompute plus a single-batch arena; `--batch 4` fallback; the arena size is printed at start |
+| memory on a 12 GB card | layer recompute plus a single-batch arena; `--batch 4` fallback; the arena size is printed at start; the no-recompute store (6.2) only engages when the whole footprint plus a 1 GB margin fits, and says so either way |
 | the card is shared | every hardware run goes through nv_shim_step.sh, after asking |
 
 ## 15. Expected performance
@@ -1004,3 +1101,19 @@ is the many small kernels and their launch cost rather than the projections; v1 
 figure, because the dev checks leave the card cold) with peak 12.29 GB — inside gpubox's 32 GB and well over design
 6.2's 12 GB target, which is what a batch-8 run of this size costs in fp32 weights plus arena. On the shim, exact mode
 is **8.94 s/step** (7.6x gpubox) for 20 steps.
+
+**After M8 (G-m8final), which supersedes the v1 speed numbers above.** Same 20-batch TF32 shape, 3 interleaved pairs,
+spreads 0.000, before = the pre-M8 tree, after = today's defaults (J44's transposes + bf16 weights in TF32 + the auto
+no-recompute store; the launch batching was removed):
+
+| machine | before | after | Δ | full arm (3,581 steps) | peak |
+|---|---:|---:|---:|---:|---|
+| card B (4090, shim) | 1.645 s/step | **0.760 s/step** | **−53.8%** | 98.2 → **45.4 min** | 8.91 → 7.92 GB |
+| gpubox (5090, nv) | 1.0150 s/step | **0.353 s/step** | **−65.2%** | 60.6 → **21.1 min** | 11.24 → 10.40 GB |
+
+On gpubox the store fits and is on; on the card it does not at batch 8 (30.17 GB wanted vs 23.69 free), so the card
+number is the recompute path with bf16 weights — transposes + bf16 only. The full-split instrument (`timing.sh`) reads
+**0.353 s/step** (22.7 rows/s, **2.47x** PyTorch's 0.143, **inside the 0.4 target**), where v1 read 1.061. Sanity: the
+step-20 loss moves 1.3226 → 1.3224 and dev CE 0.7712 → 0.7693, the bf16 activation cast's cost; exact mode is
+untouched and remains the oracle. The card's TF32 full arm at v1 defaults measured 1.675 s/step / 1 h 57 min (G-m74,
+10.4); at today's defaults the same arm projects to ~45 min of training.
