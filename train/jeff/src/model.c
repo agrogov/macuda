@@ -21,7 +21,9 @@
 // Plan M8 item 4 adds the other side of that trade: with --no-recompute (JT_NO_RECOMPUTE=1) the forward sweep keeps every
 // layer's saves in a "store" appended to the arena, so the backward reads them where the forward left them and re-runs
 // nothing — one forward less per step, at 3.2 MB of device memory per packed token. The section before jt_ctx_alloc has
-// the layout and the reasons.
+// the layout and the reasons. Since task J51 the mode needs no flag when the device has room for it: it is the default
+// when the store (plus a 1 GB margin) fits, because J39 measured its trace byte-identical to the recompute path's at -31%
+// s/step; JT_NO_RECOMPUTE=0 is how a run asks for the recompute path back.
 //
 // Plan M8.1b (JT_BF16_WEIGHTS=1) is the third memory story here: the frozen Linear weights stay bf16 in a second arena
 // instead of being widened into the fp32 one, which halves them (1.99 -> 1.00 GB) and gives their GEMMs bf16 operands.
@@ -443,7 +445,8 @@ void jt_batch_free(JtBatch *b) {
 // ---- --no-recompute: keep every layer's forward saves (plan M8 item 4) -----------------------------------------------
 // Design §6.2's layer recompute re-runs each layer's forward in front of its backward: one extra forward per step (about
 // +33% time, D§6.2) and only one layer's scratch on the device. `--no-recompute` (JT_NO_RECOMPUTE=1, the environment the
-// parity scripts can be re-run with) trades memory for that time: the forward sweep runs every layer in JT_FWD_SAVE mode
+// parity scripts can be re-run with; or, since task J51, automatic when the store fits — store_auto_mode below) trades
+// memory for that time: the forward sweep runs every layer in JT_FWD_SAVE mode
 // and leaves its saves where its backward reads them, so the backward re-runs nothing: plan M8 budgets −25% time, and the
 // measured pair on gpubox's 5090 is 1.127 -> 0.778 s/step (−31%, the recomputed forward's 0.349 s) for 29.56 GB of peak
 // against 7.84 (J39).
@@ -541,10 +544,78 @@ static size_t store_floats(const JtCtx *c) {
 }
 
 // The mode's switch, in the environment as JT_EXACT and JT_GDN_CHUNKED are: main.c's --no-recompute sets it before the
-// context is allocated, and the parity scripts can re-gate the mode without a flag. "0", or nothing, is off.
+// context is allocated, and the parity scripts can re-gate the mode without a flag. Three answers, because task J51 makes
+// the mode the *default* when the memory is there: 1 = on (any value but "0"), 0 = off (JT_NO_RECOMPUTE=0 forces the
+// recompute path), -1 = nobody said, so jt_ctx_alloc's auto rule decides. A toggle has to be able to say "nothing was
+// asked" to leave room for a default; "set but empty" keeps its old meaning, off.
 static int no_recompute_env(void) {
   const char *s = getenv("JT_NO_RECOMPUTE");
-  return s != NULL && s[0] != '\0' && strcmp(s, "0") != 0;
+  if (s == NULL) return -1;
+  return s[0] != '\0' && strcmp(s, "0") != 0;
+}
+
+// The 1 GB margin task J51's auto rule asks for: the room the store may not eat into, because what the run allocates after
+// the context (main.c's step buffers) is on the device before the context is asked, but the driver's own context and its
+// cubin copies are not something any API here counts.
+#define JT_STORE_MARGIN ((size_t)1 << 30)
+
+// Is the store on with nobody having asked for it? (JT_NO_RECOMPUTE unset, the store fits: see store_auto_mode below.)
+// Only the start-up line needs to know, so the answer is recomputed from the environment rather than kept in the context.
+static int no_recompute_auto(void) { return no_recompute_env() < 0; }
+
+// J51 rule 1: with nothing said in the environment, no-recompute is the default when the device has room for it — J39
+// measured the mode's 20-step trace byte-identical to the recompute path's at -31% s/step, so its only cost is memory. The
+// rule is "free device memory covers the store plus a 1 GB margin", and the amount the margin is added to is everything
+// the run still has on the device once the context is up: the arena with the store on top (one cudaMalloc), the GDN
+// checkpoint slots, the backward scratch and main.c's step buffers (which is why main.c allocates those first). Sizing
+// the question that way is what makes the answer safe rather than optimistic, and J51 measured why: asking for arena +
+// store + margin alone admitted an 11,052-token batch whose real footprint was 32.6 GB of a 31.84 GB card — every
+// allocation "fit", peak came out 31.82 GB, and the step time went from 0.475 to **28.84 s/step** as the driver paged.
+// Counting the whole footprint refuses that batch by 3.6 GB (30.17 wanted against 26.55 free) and admits the 5,750-token
+// shape (23.35 against 27.08), where the mode is 0.345 vs 0.470 s/step and the trace is byte-identical.
+//
+// Which of the two numbers to trust is a backend question, and both answers were measured:
+//   * real CUDA (the nv build): cudaMemGetInfo's free count, because a probe allocation is a lie there — this driver
+//     over-commits, and on gpubox the 29.8 GB probe "succeeded" in 28.4 GB of free memory (J51: the run then crawled);
+//   * the shim (JT_SHIM): the allocator, because libtinycudart has no allocation accounting ("TODO: subtract live
+//     cudaMalloc bytes", cudart_api.c:211) and answers cudaMemGetInfo with the card's total, while tinynv_malloc maps
+//     video memory and refuses a request that does not fit.
+// main.c allocates the step's buffers before the context for the same reason: they are part of the footprint asked about.
+//
+// A run with no backward has nothing to feed the store: main.c sets JT_NO_RECOMPUTE_TOKENS only when a backward will read
+// it (--eval-only and --dump-forward do not), and without it the recompute path is what those runs get.
+static int store_auto_mode(const JtCtx *c, size_t arena_base, size_t rest_work_floats) {
+  if (getenv("JT_NO_RECOMPUTE_TOKENS") == NULL) return 0;
+  const size_t store_bytes = store_floats(c) * sizeof(float);
+  const size_t rest_bytes = rest_work_floats * sizeof(float);
+  const size_t need = (arena_base + store_floats(c) + rest_work_floats) * sizeof(float) + JT_STORE_MARGIN;
+  size_t free_b = 0, total_b = 0;
+  CK(cudaMemGetInfo(&free_b, &total_b));
+#ifdef JT_SHIM
+  void *probe = NULL;
+  const int fits = cudaMalloc(&probe, need) == cudaSuccess;
+  if (fits) CK(cudaFree(probe));
+  else (void)cudaGetLastError(); // the refused probe is an answer, not an error to carry
+#else
+  const int fits = free_b >= need;
+#endif
+  if (fits) {
+    printf("ctx: no-recompute (auto): the store (%.2f GB) plus this context's %.2f GB of checkpoint/scratch and a %zu MB "
+           "margin fit in %.2f GB free, so every layer's forward saves are kept (JT_NO_RECOMPUTE=0 forces the recompute "
+           "path)\n",
+           (double)store_bytes / (double)(1u << 30), (double)rest_bytes / (double)(1u << 30),
+           (size_t)(JT_STORE_MARGIN >> 20), (double)free_b / (double)(1u << 30));
+    fflush(stdout);
+    return 1;
+  }
+  printf("ctx: recompute (auto): the store (%.2f GB) plus this context's %.2f GB of checkpoint/scratch and a %zu MB "
+         "margin want %.2f GB and %.2f of %.2f GB is free, so each layer's forward is re-run by its backward "
+         "(JT_NO_RECOMPUTE=1 forces the store)\n",
+         (double)store_bytes / (double)(1u << 30), (double)rest_bytes / (double)(1u << 30),
+         (size_t)(JT_STORE_MARGIN >> 20), (double)need / (double)(1u << 30), (double)free_b / (double)(1u << 30),
+         (double)total_b / (double)(1u << 30));
+  fflush(stdout);
+  return 0;
 }
 
 // Is the store there? c->arena_n is base + store when it is (jt_ctx_alloc), so this is the allocation's own bookkeeping and
@@ -726,10 +797,19 @@ JtCtx *jt_ctx_alloc(Model *m, Lora *l, int cap_tokens, int cap_rows, int lmax) {
   c->gdn_nseg = (lmax + JT_GDN_SEG - 1) / JT_GDN_SEG;
   if (c->gdn_nseg < 1) c->gdn_nseg = 1; // the store's ckpt slots are sized from it, so it comes before the arena
 
+  // The context's other allocations, sized before the arena because the store's auto rule (below) asks the device for one
+  // allocation that covers the arena *with* the store, and the answer has to be for the run's real footprint.
+  const size_t ckpt = gdn_ckpt_floats(cap_rows, MT_GDN_HEADS, c->gdn_nseg);
+  const size_t sp = gdn_bwd_sp_floats(cap_rows, MT_GDN_HEADS);
+  const size_t part = gdn_bwd_part_floats((size_t)cap_tokens, MT_GDN_HEADS);
+  const size_t gate = gdn_bwd_gate_floats((size_t)cap_tokens, MT_GDN_HEADS);
+
   // One allocation holds the arena and, with --no-recompute, the store directly above it (the section above). c->arena_n is
-  // the whole allocation's size in that mode, which is how every later call knows the store is there.
+  // the whole allocation's size in that mode, which is how every later call knows the store is there. With the toggle
+  // unset, J51 rule 1 decides: the mode is the default when the store fits (store_auto_mode above).
   const size_t arena_base = base_arena_floats(c);
-  const int store = no_recompute_env();
+  int store = no_recompute_env(); // -1 = nothing asked, so the memory decides
+  if (store < 0) store = store_auto_mode(c, arena_base, ckpt + sp + 2 * part + 2 * gate);
   const size_t guard = store ? guard_floats() : 0; // diagnostic only (JT_NO_RECOMPUTE_GUARD), never part of the store
   c->arena_n = arena_base;
   if (store) c->arena_n += store_floats(c) + guard;
@@ -756,10 +836,6 @@ JtCtx *jt_ctx_alloc(Model *m, Lora *l, int cap_tokens, int cap_rows, int lmax) {
            (double)guard * sizeof(float) / 1e6);
   }
 
-  const size_t ckpt = gdn_ckpt_floats(cap_rows, MT_GDN_HEADS, c->gdn_nseg);
-  const size_t sp = gdn_bwd_sp_floats(cap_rows, MT_GDN_HEADS);
-  const size_t part = gdn_bwd_part_floats((size_t)cap_tokens, MT_GDN_HEADS);
-  const size_t gate = gdn_bwd_gate_floats((size_t)cap_tokens, MT_GDN_HEADS);
   CK(cudaMalloc((void **)&c->gdn_ckpt, ckpt * sizeof(float)));
   CK(cudaMalloc((void **)&c->gdn_work.sp, sp * sizeof(float)));
   CK(cudaMalloc((void **)&c->gdn_work.dq_part, part * sizeof(float)));
@@ -771,10 +847,10 @@ JtCtx *jt_ctx_alloc(Model *m, Lora *l, int cap_tokens, int cap_rows, int lmax) {
          lmax, (double)arena_base * sizeof(float) / 1e9, cap_tokens, JT_ARENA_FLOATS_PER_TOKEN, MT_FULL_HEADS, lmax,
          c->gdn_nseg, (double)ckpt * sizeof(float) / 1e9, (double)(sp + 2 * part + 2 * gate) * sizeof(float) / 1e9);
   if (store)
-    printf("ctx: no-recompute (JT_NO_RECOMPUTE): every layer's forward saves are kept, store %.2f GB on top of the arena "
+    printf("ctx: no-recompute (%s): every layer's forward saves are kept, store %.2f GB on top of the arena "
            "for batches of up to %d tokens (%.2f KB per packed token: %d layers' saves + their post-mixer residuals, %d "
            "GDN checkpoint slots, one shared work region); a bigger batch takes the recompute path\n",
-           (double)store_n * sizeof(float) / 1e9, store_tokens(c),
+           no_recompute_auto() ? "auto" : "JT_NO_RECOMPUTE", (double)store_n * sizeof(float) / 1e9, store_tokens(c),
            (double)store_floats_per_token() * sizeof(float) / 1024.0, MT_LAYERS, m->n_gdn);
   fflush(stdout);
   // One device-wide barrier, once, after the load: everything before this point uploaded with plain cudaMemcpy on the

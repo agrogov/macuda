@@ -1,0 +1,357 @@
+--- a/train/jeff/src/layer_attn.c
++++ b/train/jeff/src/layer_attn.c
+@@ -13,10 +13,7 @@
+ //   q = RMSNorm(q; q_norm), k = RMSNorm(k; k_norm)            rmsnorm_fwd with d = 256, zero-centred (rows = n*8 for q,
+ //                                                             n*2 for k)
+ //   q, k = RoPE(q, p), RoPE(k, p)                             rope_fwd with p = t - off[row_of[t]] (row-local, design §7)
+-//   per row: to_head_major, kv_expand (q, k, v)                 design §8.2's layout, one launch each per row — or, with
+-//                                                             JT_ATTN_BATCH=<cap> on, once for a chunk of rows (see
+-//                                                             "launch batching" below)
+-//   per row: S = q k^T (gemm_batched), attn_softmax_fwd(scale 1/16), PV (gemm_batched), then the chunk's
++//   per row: to_head_major, kv_expand, S = q k^T (gemm_batched), attn_softmax_fwd(scale 1/16), PV (gemm_batched),
+ //            from_head_major                                     design §5, §8.2; one row's P at a time, bounded by c->lmax
+ //   o    = o * sigmoid(gate)                                  k_sigmoid_gate_fwd
+ //   out  = o_proj(o)                                          linear_fwd
+@@ -30,8 +27,7 @@
+ //   per row (design §8.2's second block)                        dP = dO V^T, dV = P^T dO, attn_softmax_bwd(P, dP),
+ //                                                               dQ = dS K, dK = dS^T Q; P is recomputed from the saved q
+ //                                                               and k (only one row's P is ever kept), then from_head_major
+-//                                                               and kv_reduce collapse dk/dv to the 2 KV heads. With
+-//                                                               JT_ATTN_BATCH these five launches are per chunk, not per row
++//                                                               and kv_reduce collapse dk/dv to the 2 KV heads
+ //   dq, dk = rope_bwd(...)                                      one launch each over the packed batch (positions are
+ //                                                               row-local, so the whole batch is in the transposed tables)
+ //   q_norm/k_norm backward                                      rmsnorm_bwd, d = 256, zero-centred (design §4.3)
+@@ -72,9 +68,7 @@
+ // uses. Its own temporaries come from the work half and are given back before it returns (design §6.2).
+ #include "layer.h"
+ 
+-#include <limits.h>
+ #include <stdio.h>
+-#include <stdlib.h>
+ 
+ #include "act.h"    // k_sigmoid_gate_fwd, k_sigmoid_gate_bwd
+ #include "attn.h"   // attn_softmax_fwd, attn_softmax_bwd
+@@ -139,132 +133,64 @@
+   }
+ }
+ 
+-// ---- launch batching (plan M8 item 5) ------------------------------------------------------------------------------
+-// Everything around the per-row GEMMs is token-wise: to_head_major, kv_expand, from_head_major and kv_reduce each read and
+-// write one (token, head) pair, so those launches need not be per row. One launch covers a whole CHUNK of consecutive
+-// rows, laid out over the chunk's packed tokens: head block h of the chunk starts at h*ctok*256, so a row's slice of it
+-// starts at h*ctok*256 + (off - coff)*256. The per-row GEMMs then take a batch stride of ctok*256 instead of L*256 — the
+-// head blocks' rows are still 256 floats and the leading dimensions are unchanged, so the same values land in the same
+-// places, bit for bit; only the number of launches changes. Per layer that is 6 launches in the forward and 11 in the
+-// backward instead of 6*rows and 11*rows (rows = the batch's row count), which is the whole point on the shim, where a
+-// launch costs orders of magnitude more than it does on the card (plan M8 item 5; notes/J40.md has the counts).
+-//
+-// A chunk is capped at the toggle's value so the hoisted blocks cost the arena nothing new: a chunk holds at most
+-// max(cap, lmax) tokens either way (a single long row is a chunk of its own, which attn_chunk_max() sizes for), and the
+-// arena's per-token budget (JT_ARENA_FLOATS_PER_TOKEN, 98,304) covers 10,240 floats per chunk token in the forward (4
+-// head-major blocks + kv_expand's scratch) and 16,384 in the backward (7 blocks + scratch) with room to spare — the
+-// blocks are sized by min(that, n), the batch's own token count, so no cap can exceed the budget. The work half's own
+-// rule is unchanged: everything below comes from jt_work_alloc and is given back before returning.
+-//
+-// The switch is JT_ATTN_BATCH=<cap>, in the environment as JT_EXACT and JT_GDN_CHUNKED are: unset or 0 is the per-row
+-// path above, byte for byte (one row per chunk, so the same kernels are called with the same arguments in the same
+-// order); a positive value chunks consecutive rows up to <cap> packed tokens and prints one start-up line, which is what
+-// scripts/ab.sh's JT_EXPECT checks — a toggle that silently did nothing cannot pass it. The value is parsed once, in a
+-// function-scope static, and the one line is printed the first time either mixer runs (gemm_init()'s pattern).
+-static int attn_batch_cap(void) {
+-  static int cap = -1, told; // the toggle, and whether the start-up line has been printed
+-  if (cap < 0) {
+-    const char *e = getenv("JT_ATTN_BATCH");
+-    char *end = NULL;
+-    const long v = e != NULL ? strtol(e, &end, 10) : 0;
+-    cap = (e != NULL && end != e && v > 0) ? (int)(v > INT_MAX ? INT_MAX : v) : 0;
+-  }
+-  if (cap > 0 && !told) {
+-    printf("attn: launch batching, cap %d\n", cap);
+-    fflush(stdout);
+-    told = 1;
+-  }
+-  return cap;
+-}
+-
+-// One chunk's attention buffers (design §8.2): [8][ctok][256] head-major for q, k, v and o, one token-major [ctok][2048]
+-// scratch for kv_expand's output, and the [8][lmax][lmax] scores and probabilities — those are one row's and reused by
+-// every row of every chunk, which is the arena's 2 x 8 x lmax^2 term. jt_work_alloc dies with the numbers if the arena is
+-// ever sized too small.
++// One row's attention buffers (design §8.2): [8][lmax][256] head-major for q, k, v and o, one token-major [lmax][2048]
++// scratch for kv_expand's output, and the [8][lmax][lmax] scores and probabilities. Sized once for c->lmax and reused by
++// every row, so a batch costs the longest row, not the sum. That is the arena's extra 2 x 8 x lmax^2 term plus about
++// 10 K floats per position; jt_work_alloc dies with the numbers if the arena is ever sized too small.
+ typedef struct {
+   float *qh, *kh, *vh, *oh, *kv_tok, *sc, *p;
+ } AttnRow;
+ 
+-// The tokens the chunk blocks are sized for: the cap, unless a single row is longer than it (then that row is a chunk).
+-// The per-row path (cap <= 0) keeps the committed tree's c->lmax-sized blocks, so its allocation is unchanged too.
+-static int attn_chunk_max(const JtCtx *c, int n, int cap) {
+-  int m;
+-  if (cap <= 0) return c->lmax;
+-  m = cap < c->lmax ? c->lmax : cap;
+-  return m < n ? m : n;
+-}
+-
+-static void attn_row_alloc(JtCtx *c, AttnRow *r, int ctok_max) {
+-  const size_t ct = (size_t)ctok_max;
++static void attn_row_alloc(JtCtx *c, AttnRow *r) {
+   const size_t l = (size_t)c->lmax;
+-  const size_t hm = (size_t)MT_FULL_HEADS * ct * MT_HEAD_DIM;
++  const size_t hm = (size_t)MT_FULL_HEADS * l * MT_HEAD_DIM;
+   const size_t sq = (size_t)MT_FULL_HEADS * l * l;
+   r->qh = jt_work_alloc(c, hm);
+   r->kh = jt_work_alloc(c, hm);
+   r->vh = jt_work_alloc(c, hm);
+   r->oh = jt_work_alloc(c, hm);
+-  r->kv_tok = jt_work_alloc(c, ct * MT_O_IN);
++  r->kv_tok = jt_work_alloc(c, l * MT_O_IN);
+   r->sc = jt_work_alloc(c, sq);
+   r->p = jt_work_alloc(c, sq);
+ }
+ 
+-// The first row after the chunk that starts at r0: consecutive rows whose tokens fit the cap, but always at least one (a
+-// row longer than the cap is a chunk of its own, which attn_chunk_max() sized the blocks for). With the toggle off (cap <=
+-// 0) a chunk is exactly one row, which is the committed tree's per-row loop. Shared by both directions, so the forward and
+-// the backward chunk the batch the same way and a row's slice is the same in both.
+-static int attn_chunk_end(const JtBatch *b, int r0, int cap) {
+-  int r1 = r0, ctok = 0;
+-  while (r1 < b->rows) {
+-    const int L = b->off[r1 + 1] - b->off[r1];
+-    if (r1 > r0 && (cap <= 0 || ctok + L > cap)) break;
+-    ctok += L;
+-    r1++;
+-  }
+-  return r1;
+-}
+-
+-// The chunk's layout pass, in the order design §8.2 lists it: q is transposed to head-major, and k and v each go through
+-// kv_expand (which copies KV group g to its 4 query heads h = g*group + r, group = h/4) before the same transpose
+-// (design §3.5); MT_KV_HEADS x group = MT_FULL_HEADS is the model's only consistent value.
+-static void attn_chunk_prep(JtCtx *c, const AttnSave *s, const AttnRow *r, int coff, int ctok) {
++// One row's slice [off, off+L) of design §8.2, in the order the design lists it. q, k and v are token-major; the GEMMs
++// want head-major per head, so to_head_major does the transpose and kv_expand copies each KV group to its 4 query heads
++// (h = g*group + r, i.e. group = h/4) before the same transpose. o goes back to token-major, into the caller's o_pre.
++static void attn_row(JtCtx *c, const AttnSave *s, AttnRow *r, int off, int L) {
++  // h = g*group + r (design §3.5): the 8 query heads are 4 per KV head, so kv_expand copies group g to heads
++  // [g*group, g*group+group). MT_KV_HEADS x group = MT_FULL_HEADS is the model's only consistent value.
+   const int group = MT_FULL_HEADS / MT_KV_HEADS;
++  const long hm = (long)L * (long)MT_HEAD_DIM;
++  const long sq = (long)L * (long)L;
+   cudaStream_t st = c->stream;
+-  jt_to_head_major(s->q + (size_t)coff * MT_O_IN, r->qh, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-  jt_kv_expand(s->k + (size_t)coff * MT_KV_OUT, r->kv_tok, ctok, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+-  jt_to_head_major(r->kv_tok, r->kh, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-  jt_kv_expand(s->v + (size_t)coff * MT_KV_OUT, r->kv_tok, ctok, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+-  jt_to_head_major(r->kv_tok, r->vh, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-}
+ 
+-// One row's slice [off, off+L) of design §8.2's first block, inside a chunk that starts at coff: the two GEMMs and the
+-// softmax, at the row's slice of the chunk's head-major blocks (the per-head step is ctok*256, not L*256).
+-static void attn_row(JtCtx *c, AttnRow *r, int coff, int off, int L, int ctok) {
+-  const long hm = (long)ctok * (long)MT_HEAD_DIM;
+-  const long sq = (long)L * (long)L;
+-  const size_t at = (size_t)(off - coff) * MT_HEAD_DIM; // the row's first token, in every head block
+-  const float *qh = r->qh + at, *kh = r->kh + at, *vh = r->vh + at;
+-  float *oh = r->oh + at;
++  jt_to_head_major(s->q + (size_t)off * MT_O_IN, r->qh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  jt_kv_expand(s->k + (size_t)off * MT_KV_OUT, r->kv_tok, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
++  jt_to_head_major(r->kv_tok, r->kh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  jt_kv_expand(s->v + (size_t)off * MT_KV_OUT, r->kv_tok, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
++  jt_to_head_major(r->kv_tok, r->vh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+ 
+   // Sc[h] = Q[h] K[h]^T  [L,L]: A is stored [M,K] = [L,256], B is stored [N,K] = [L,256] (hence tb = 1).
+-  gemm_batched(c->cublas, 0, 1, L, L, MT_HEAD_DIM, 1.0f, qh, hm, kh, hm, 0.0f, r->sc, sq, MT_FULL_HEADS);
+-  attn_softmax_fwd(r->sc, r->p, L, MT_FULL_HEADS, ATTN_SCALE, c->stream); // P[h] = causal_softmax(Sc[h] / 16)
++  gemm_batched(c->cublas, 0, 1, L, L, MT_HEAD_DIM, 1.0f, r->qh, hm, r->kh, hm, 0.0f, r->sc, sq, MT_FULL_HEADS);
++  attn_softmax_fwd(r->sc, r->p, L, MT_FULL_HEADS, ATTN_SCALE, st); // P[h] = causal_softmax(Sc[h] / 16)
+   // O[h] = P[h] V[h]  [L,256]: A is stored [M,K] = [L,L], B is stored [K,N] = [L,256] (tb = 0).
+-  gemm_batched(c->cublas, 0, 0, L, MT_HEAD_DIM, L, 1.0f, r->p, sq, vh, hm, 0.0f, oh, hm, MT_FULL_HEADS);
++  gemm_batched(c->cublas, 0, 0, L, MT_HEAD_DIM, L, 1.0f, r->p, sq, r->vh, hm, 0.0f, r->oh, hm, MT_FULL_HEADS);
++  jt_from_head_major(r->oh, s->o_pre + (size_t)off * MT_O_IN, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
+ }
+ 
+-// One chunk's attention backward buffers (design §8.2's second block): the forward's q/k/v head-major scratch again (the
+-// backward re-derives P from them), the cotangent dO head-major, the three cotangents dQ/dK/dV head-major, one token-major
+-// [ctok][2048] scratch for from_head_major and kv_reduce, and [8][lmax][lmax] for P, dP and dS. dP takes over the score
+-// buffer's words (`sc`) once P exists, so a row costs three L x L slabs, not four; jt_work_alloc still wants all of them
+-// live at the work half's bottom, which is why they are taken here in one place.
++// One row's attention backward buffers (design §8.2's second block): the forward's q/k/v head-major scratch again (the
++// backward re-derives P from them), the cotangent dO head-major, the three cotangents dQ/dK/dV head-major, one
++// token-major [lmax][2048] scratch for kv_expand and from_head_major, and [8][lmax][lmax] for P, dP and dS.
++// dP takes over the score buffer's words (`sc`) once P exists, so the row costs three L x L slabs, not four; jt_work_alloc
++// still wants all of them live at the work half's bottom, which is why they are taken here in one place.
+ typedef struct {
+   float *qh, *kh, *vh, *doh, *dqh, *dkh, *dvh, *kv_tok, *sc, *p, *dsc;
+ } AttnBwdRow;
+ 
+-static void attn_bwd_row_alloc(JtCtx *c, AttnBwdRow *r, int ctok_max) {
+-  const size_t ct = (size_t)ctok_max;
++static void attn_bwd_row_alloc(JtCtx *c, AttnBwdRow *r) {
+   const size_t l = (size_t)c->lmax;
+-  const size_t hm = (size_t)MT_FULL_HEADS * ct * MT_HEAD_DIM;
++  const size_t hm = (size_t)MT_FULL_HEADS * l * MT_HEAD_DIM;
+   const size_t sq = (size_t)MT_FULL_HEADS * l * l;
+   r->qh = jt_work_alloc(c, hm);
+   r->kh = jt_work_alloc(c, hm);
+@@ -273,61 +199,50 @@
+   r->dqh = jt_work_alloc(c, hm);
+   r->dkh = jt_work_alloc(c, hm);
+   r->dvh = jt_work_alloc(c, hm);
+-  r->kv_tok = jt_work_alloc(c, ct * MT_O_IN);
++  r->kv_tok = jt_work_alloc(c, l * MT_O_IN);
+   r->sc = jt_work_alloc(c, sq);
+   r->p = jt_work_alloc(c, sq);
+   r->dsc = jt_work_alloc(c, sq);
+ }
+ 
+-// The chunk's layout pass: the same five token-wise ops as the forward's attn_chunk_prep(), plus the cotangent dO.
+-static void attn_chunk_prep_bwd(JtCtx *c, const AttnSave *s, const AttnBwdRow *r, const float *d_o, int coff, int ctok) {
+-  const int group = MT_FULL_HEADS / MT_KV_HEADS;
+-  cudaStream_t st = c->stream;
+-  jt_to_head_major(s->q + (size_t)coff * MT_O_IN, r->qh, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-  jt_kv_expand(s->k + (size_t)coff * MT_KV_OUT, r->kv_tok, ctok, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+-  jt_to_head_major(r->kv_tok, r->kh, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-  jt_kv_expand(s->v + (size_t)coff * MT_KV_OUT, r->kv_tok, ctok, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+-  jt_to_head_major(r->kv_tok, r->vh, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-  jt_to_head_major(d_o + (size_t)coff * MT_O_IN, r->doh, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-}
+-
+ // One row's slice [off, off+L) of design §8.2's backward, in the order the design lists it. The forward's P is
+ // recomputed from the saved q and k by the same two calls attn_row() makes (the score GEMM and attn_softmax_fwd), so the
+ // softmax backward differentiates the forward's own P; the four GEMMs are then the transposes of the forward's two
+-// (design §5), with attn_softmax_bwd folding in the 1/16 (design §4.7's `dq = c * sum dS k`). dQ, dK and dV stay
+-// head-major over the chunk; attn_chunk_tail() turns them token-major and kv_reduces dk/dv to the 2 KV heads.
+-static void attn_row_bwd(JtCtx *c, AttnBwdRow *r, int coff, int off, int L, int ctok) {
+-  const long hm = (long)ctok * (long)MT_HEAD_DIM;
++// (design §5), with attn_softmax_bwd folding in the 1/16 (design §4.7's `dq = c * sum dS k`). dq comes out token-major
++// with all 8 query heads and dk/dv through from_head_major and kv_reduce, i.e. the 4 query heads of a group summed into
++// its KV head (design §4.7's `summed over the 4 query heads of the group`).
++static void attn_row_bwd(JtCtx *c, const AttnSave *s, AttnBwdRow *r, const float *d_o, int off, int L, float *dq,
++                         float *dk, float *dv) {
++  const int group = MT_FULL_HEADS / MT_KV_HEADS;
++  const long hm = (long)L * (long)MT_HEAD_DIM;
+   const long sq = (long)L * (long)L;
+-  const size_t at = (size_t)(off - coff) * MT_HEAD_DIM; // the row's first token, in every head block
+-  const float *qh = r->qh + at, *kh = r->kh + at, *vh = r->vh + at, *doh = r->doh + at;
+-  float *dqh = r->dqh + at, *dkh = r->dkh + at, *dvh = r->dvh + at;
++  cudaStream_t st = c->stream;
+ 
++  jt_to_head_major(s->q + (size_t)off * MT_O_IN, r->qh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  jt_kv_expand(s->k + (size_t)off * MT_KV_OUT, r->kv_tok, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
++  jt_to_head_major(r->kv_tok, r->kh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  jt_kv_expand(s->v + (size_t)off * MT_KV_OUT, r->kv_tok, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
++  jt_to_head_major(r->kv_tok, r->vh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  jt_to_head_major(d_o + (size_t)off * MT_O_IN, r->doh, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++
+   // P = causal_softmax(Q K^T / 16), the forward's two calls (design §8.2's first two lines).
+-  gemm_batched(c->cublas, 0, 1, L, L, MT_HEAD_DIM, 1.0f, qh, hm, kh, hm, 0.0f, r->sc, sq, MT_FULL_HEADS);
+-  attn_softmax_fwd(r->sc, r->p, L, MT_FULL_HEADS, ATTN_SCALE, c->stream);
++  gemm_batched(c->cublas, 0, 1, L, L, MT_HEAD_DIM, 1.0f, r->qh, hm, r->kh, hm, 0.0f, r->sc, sq, MT_FULL_HEADS);
++  attn_softmax_fwd(r->sc, r->p, L, MT_FULL_HEADS, ATTN_SCALE, st);
+   // dP = dO V^T (the same (ta=0, tb=1) shape as Sc, so it takes Sc's words over now that P exists).
+-  gemm_batched(c->cublas, 0, 1, L, L, MT_HEAD_DIM, 1.0f, doh, hm, vh, hm, 0.0f, r->sc, sq, MT_FULL_HEADS);
++  gemm_batched(c->cublas, 0, 1, L, L, MT_HEAD_DIM, 1.0f, r->doh, hm, r->vh, hm, 0.0f, r->sc, sq, MT_FULL_HEADS);
+   // dV = P^T dO, the forward's PV GEMM with its operands swapped (ta = 1).
+-  gemm_batched(c->cublas, 1, 0, L, MT_HEAD_DIM, L, 1.0f, r->p, sq, doh, hm, 0.0f, dvh, hm, MT_FULL_HEADS);
++  gemm_batched(c->cublas, 1, 0, L, MT_HEAD_DIM, L, 1.0f, r->p, sq, r->doh, hm, 0.0f, r->dvh, hm, MT_FULL_HEADS);
+   // dS = (1/16) P (dP - sum_s' P dP), exactly 0 above the diagonal (design §4.7, kernels/attn.h).
+-  attn_softmax_bwd(r->p, r->sc, r->dsc, L, MT_FULL_HEADS, ATTN_SCALE, c->stream);
++  attn_softmax_bwd(r->p, r->sc, r->dsc, L, MT_FULL_HEADS, ATTN_SCALE, st);
+   // dQ = dS K [L,256] and dK = dS^T Q [L,256].
+-  gemm_batched(c->cublas, 0, 0, L, MT_HEAD_DIM, L, 1.0f, r->dsc, sq, kh, hm, 0.0f, dqh, hm, MT_FULL_HEADS);
+-  gemm_batched(c->cublas, 1, 0, L, MT_HEAD_DIM, L, 1.0f, r->dsc, sq, qh, hm, 0.0f, dkh, hm, MT_FULL_HEADS);
+-}
++  gemm_batched(c->cublas, 0, 0, L, MT_HEAD_DIM, L, 1.0f, r->dsc, sq, r->kh, hm, 0.0f, r->dqh, hm, MT_FULL_HEADS);
++  gemm_batched(c->cublas, 1, 0, L, MT_HEAD_DIM, L, 1.0f, r->dsc, sq, r->qh, hm, 0.0f, r->dkh, hm, MT_FULL_HEADS);
+ 
+-// The chunk's way back to token-major: dQ is one from_head_major, and dV/dK go through from_head_major and kv_reduce,
+-// i.e. the 4 query heads of a group summed into its KV head (design §4.7's `summed over the 4 query heads of the group`).
+-// The two reductions share kv_tok, which is fine: both are on c->stream, in this order.
+-static void attn_chunk_tail(JtCtx *c, const AttnBwdRow *r, int ctok, float *dq, float *dk, float *dv) {
+-  const int group = MT_FULL_HEADS / MT_KV_HEADS;
+-  cudaStream_t st = c->stream;
+-  jt_from_head_major(r->dqh, dq, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-  jt_from_head_major(r->dvh, r->kv_tok, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-  jt_kv_reduce(r->kv_tok, dv, ctok, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+-  jt_from_head_major(r->dkh, r->kv_tok, ctok, MT_FULL_HEADS, MT_HEAD_DIM, st);
+-  jt_kv_reduce(r->kv_tok, dk, ctok, MT_KV_HEADS, group, MT_HEAD_DIM, st);
++  jt_from_head_major(r->dqh, dq + (size_t)off * MT_O_IN, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  jt_from_head_major(r->dvh, r->kv_tok, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  jt_kv_reduce(r->kv_tok, dv + (size_t)off * MT_KV_OUT, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
++  jt_from_head_major(r->dkh, r->kv_tok, L, MT_FULL_HEADS, MT_HEAD_DIM, st);
++  jt_kv_reduce(r->kv_tok, dk + (size_t)off * MT_KV_OUT, L, MT_KV_HEADS, group, MT_HEAD_DIM, st);
+ }
+ 
+ int layer_attn_mixer_fwd(JtCtx *c, const LayerWeights *lw, const float *x_in, int n, const JtBatch *b, float *x_out,
+@@ -367,8 +282,7 @@
+   float *o_gated = jt_work_alloc(c, (size_t)n * MT_O_IN);
+   float *out = jt_work_alloc(c, (size_t)n * MT_HIDDEN);
+   AttnRow row;
+-  const int cap = attn_batch_cap(); // 0 = the per-row path; > 0 = a chunk of at most `cap` packed tokens
+-  attn_row_alloc(c, &row, attn_chunk_max(c, n, cap));
++  attn_row_alloc(c, &row);
+ 
+   // a = RMSNorm(x_in; input_layernorm); then the four projections off it.
+   rmsnorm_fwd(x_in, lw->input_norm, s.a, s.r_in, n, MT_HIDDEN, 1, c->stream);
+@@ -388,20 +302,9 @@
+   rmsnorm_fwd(s.k_raw, lw->k_norm, s.k, s.r_k, n * MT_KV_HEADS, MT_HEAD_DIM, 1, c->stream);
+   rope_fwd(s.k, b->off_dev, b->row_of, n, MT_KV_HEADS, MT_HEAD_DIM, c->rope_cos, c->rope_sin, c->stream);
+ 
+-  // The row chunks (attn_chunk_end): one layout pass per chunk, then the per-row GEMMs, then the chunk's way back to
+-  // token-major. With JT_ATTN_BATCH a batch of rows that fits the cap is one chunk, i.e. six launches per layer instead of
+-  // six per row; without it a chunk is one row and this is the per-row loop it replaced.
+-  for (int r0 = 0; r0 < b->rows;) {
+-    const int r1 = attn_chunk_end(b, r0, cap), coff = b->off[r0], cend = b->off[r1];
+-    if (cend > coff) {
+-      attn_chunk_prep(c, &s, &row, coff, cend - coff);
+-      for (int r = r0; r < r1; r++) {
+-        const int off = b->off[r], L = b->off[r + 1] - off;
+-        if (L > 0) attn_row(c, &row, coff, off, L, cend - coff);
+-      }
+-      jt_from_head_major(row.oh, s.o_pre + (size_t)coff * MT_O_IN, cend - coff, MT_FULL_HEADS, MT_HEAD_DIM, c->stream);
+-    }
+-    r0 = r1;
++  for (int r = 0; r < b->rows; r++) {
++    const int off = b->off[r], L = b->off[r + 1] - off;
++    if (L > 0) attn_row(c, &s, &row, off, L);
+   }
+ 
+   // o = o * sigmoid(gate) over the whole packed batch (the gate is laid out like o, [n][8*256]).
+@@ -467,8 +370,7 @@
+   float *da = jt_work_alloc(c, n_h);          // the three projections' shared input gradient (design §4.6)
+   float *dxin = jt_work_alloc(c, n_h);        // the input norm's dx
+   AttnBwdRow row;
+-  const int cap = attn_batch_cap(); // 0 = the per-row path; > 0 = a chunk of at most `cap` packed tokens
+-  attn_bwd_row_alloc(c, &row, attn_chunk_max(c, n, cap));
++  attn_bwd_row_alloc(c, &row);
+ 
+   // gate = qgate_split(qg)'s second half; q_pre is already saved, so the split's q half goes over dqg (which is only
+   // filled by the merge at the end): one pass over [n,4096] instead of another 2048 floats per token in the saves.
+@@ -483,20 +385,10 @@
+   // 2. the output gate: do = dog sig(gate), dgate = dog o sig(gate) (1 - sig(gate)).
+   k_sigmoid_gate_bwd(d_o_gated, s.o_pre, gate, d_o, dgate, n * MT_O_IN, c->stream);
+ 
+-  // 3. per chunk: design §8.2's second block, into the token-major dq/dk/dv (one layout pass and one way back per chunk;
+-  // with the toggle off a chunk is one row).
+-  for (int r0 = 0; r0 < b->rows;) {
+-    const int r1 = attn_chunk_end(b, r0, cap), coff = b->off[r0], cend = b->off[r1];
+-    if (cend > coff) {
+-      attn_chunk_prep_bwd(c, &s, &row, d_o, coff, cend - coff);
+-      for (int r = r0; r < r1; r++) {
+-        const int off = b->off[r], L = b->off[r + 1] - off;
+-        if (L > 0) attn_row_bwd(c, &row, coff, off, L, cend - coff);
+-      }
+-      attn_chunk_tail(c, &row, cend - coff, dq + (size_t)coff * MT_O_IN, dk + (size_t)coff * MT_KV_OUT,
+-                      dv + (size_t)coff * MT_KV_OUT);
+-    }
+-    r0 = r1;
++  // 3. per row: design §8.2's second block, into the token-major dq/dk/dv.
++  for (int r = 0; r < b->rows; r++) {
++    const int off = b->off[r], L = b->off[r + 1] - off;
++    if (L > 0) attn_row_bwd(c, &s, &row, d_o, off, L, dq, dk, dv);
+   }
+ 
+   // 4. RoPE backward (design §4.7: the rotation transposed) and the two norms (design §4.3, d = 256, zero-centred). Both

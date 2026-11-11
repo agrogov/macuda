@@ -15,7 +15,9 @@
 // weight GEMMs) are then kept as bf16 in `wb`, the checkpoint's own bits, and no fp32 copy of them is allocated — the
 // fp32 arena shrinks to the norms, the conv taps and the gate vectors, about 2 MB. The embedding table is bf16 in both
 // storages, so the whole frozen set goes 1.99 + 0.51 GB -> 1.00 + 0.51 GB (the load prints `weights: bf16 (x GB)`).
-// Exact mode ignores the toggle (src/model.c): M6.2's trace is bit-identical only because the exact path never changes.
+// Since task J51 it is the *default* in TF32 mode (src/main.c's m8_defaults: worth it on gpubox and on the card, in
+// G-m8arm's arm); JT_BF16_WEIGHTS=0 asks for the fp32 storage. Exact mode never takes it (src/main.c does not set it
+// there, and model.c refuses it): M6.2's trace is bit-identical only because the exact path never changes.
 //
 // Nothing is random and nothing is a guess: st_get checks the dtype and every dimension of every tensor it is asked for
 // (src/st.h), so a checkpoint with a different layout fails at load, naming the tensor and both shapes.

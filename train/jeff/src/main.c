@@ -1592,6 +1592,51 @@ static void caps_take(Caps *c, const Split *s) {
   }
 }
 
+// ---- the M8 defaults: the one place a default lives (task J51) --------------------------------------------------------
+// Task J51's rule, applied separately to each backend: a speed item that was measured WORTH there (B at least 1.5% faster
+// with the gap above 3x the larger side's run-to-run spread), that ran in G-m8arm's full arm and that passed
+// G-m8probe's card sanity becomes that backend's default; everything else stays an opt-in toggle. notes/J51.md carries
+// the full table — every candidate, its numbers on both backends and which rule decided it.
+//
+// A default is still an override in both directions (rule 4): the environment always wins, so JT_<X>=0 gives the older
+// path back and JT_<X>=1 forces the new one. Only an *unset* variable is defaulted here, and each default prints one
+// start-up line, which is what the scripts' JT_EXPECT matches — a default that silently did nothing cannot pass rule 9.
+//
+// Exact mode is left alone: exact fp32 is the oracle every gradient gate and M6.2's exact trace are measured against
+// (design §6.1, §10.2), so a numerics-changing default is TF32-only and an exact run prints nothing new. The one
+// bit-identical default (J39's store, J51 rule 1) is mode-independent and is decided in src/model.c, where the memory it
+// needs is known.
+static void m8_defaults(void) {
+  const int exact = gemm_is_exact();
+
+  // JT_BF16_WEIGHTS=1 — the frozen Linear weights stay bf16 and their GEMMs take bf16 operands (plan M8.1b, J46/J47),
+  // 1.99 -> 1.00 GB of weights. Worth it on both backends, in the arm, and its card sanity passed:
+  //   gpubox (nv build): J47's ab.sh, 5 interleaved pairs, TF32 — 0.3900 -> 0.3450 s/step (-11.54%), the gap 9.0x the
+  //     larger side's spread, peak 11.24 -> 10.31 GB;
+  //   the shim (JT_SHIM, the eGPU): G-m8probe variant 3 on card B — 1.135 -> 0.750 s/step (-33.9%, spread 0.000), card
+  //     sanity: step-20 loss 1.3224 vs 1.3226, eval max |dp| 0.0063 of the 0.05 gate, argmax 159/160;
+  //   both: it was G-m8arm's arm, and both CE gates held (dev |d| 0.00326 of the 0.01 gate, test |d| 0.00830 of 0.02).
+  //     That arm also missed 4 of 15 score.py metrics against arm.sh's Python-only band; the note records why that is
+  //     the band (the non-BF16 TF32 arm misses the same th0.5.precision and design §10.3.3's as-built band is the
+  //     four-run one) and G-m8final re-checks the >0.5 card count.
+  // TF32 only, and that is not a nicety: under JT_EXACT the default is not even set, so an exact run is bit-reproducible
+  // by construction and JT_EXACT=1 JT_BF16_WEIGHTS=1 is still the "bf16 ignored" line ab.sh --same reads.
+#ifdef JT_SHIM
+  // The shim build (the eGPU): G-m8probe variant 3's -33.9% on card B is the WORTH number, and G-m8probe is also the card
+  // sanity (step-20 loss, eval |dp|, argmax). On.
+  const int bf16_default = 1;
+#else
+  // The nv build (gpubox): J47's ab.sh -11.54% at gap 9.0x the spread is the WORTH number; the arm was this build. On.
+  const int bf16_default = 1;
+#endif
+  if (bf16_default && !exact && getenv("JT_BF16_WEIGHTS") == NULL) {
+    if (setenv("JT_BF16_WEIGHTS", "1", 1) != 0) die("setenv(JT_BF16_WEIGHTS): %s", strerror(errno));
+    printf("jefftrain: default JT_BF16_WEIGHTS=1 in TF32 mode (frozen Linear weights stay bf16: -11.5%% on gpubox, -33.9%% "
+           "on the card; JT_BF16_WEIGHTS=0 restores fp32 storage)\n");
+    fflush(stdout);
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc == 1) {
     usage(stdout);
@@ -1674,6 +1719,7 @@ int main(int argc, char **argv) {
 
   // ---- the model ------------------------------------------------------------------------------------------------------
   gemm_init(); // prints "gemm: exact fp32" or "gemm: tf32" once, before anything allocates (design §5)
+  m8_defaults(); // after gemm_init: a default that changes numerics is TF32-only, and the mode is what says so
   Lora *lora = lora_alloc();
   Model *m = model_load(a.model, lora);
   if (a.adapter != NULL) {
@@ -1706,10 +1752,13 @@ int main(int argc, char **argv) {
   path_join(t.adapter_dir, sizeof t.adapter_dir, a.output, "adapter");
   mkdirs(a.output);
 
-  t.c = jt_ctx_alloc(m, lora, caps.cap_tokens, caps.cap_rows, caps.lmax);
+  // The step's own device buffers first, the context last: src/model.c decides whether J39's no-recompute store fits, and
+  // that measurement (task J51) is only honest when everything else the run allocates is already on the device. The peak
+  // is the same either way; only the order of two allocations changed.
   Dev dev;
   dev_init(&dev, caps.cap_tokens, caps.cap_rows);
   t.d = &dev;
+  t.c = jt_ctx_alloc(m, lora, caps.cap_tokens, caps.cap_rows, caps.lmax);
   t.peak = dev_mem_gb(); // what the load and the context already hold
   trace_open(&t.trace, a.trace);
 
