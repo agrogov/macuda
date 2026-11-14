@@ -1,70 +1,96 @@
-# RTX 4090 tensor unlock — specification
+# RTX 4090 tensor unlock specification
 
-Date: 2026-11-11. Status: proposed; no implementation or macuda hardware validation.
+## Status
 
-Scope: personal use on the owner's Mac with an RTX 4090 over Thunderbolt. This is not a distribution project. Companion documents: [design](design.md), [implementation and validation plan](plan.md).
+Experimental and opt-in. The implementation targets one desktop NVIDIA RTX 4090
+(`10de:2684`, AD102) reached through the existing TinyGPU transport. The installed
+TinyGPU application, server, and signed DriverKit extension remain unchanged.
 
-## Objective and evidence
+The unlock runs in macuda userspace before the normal runtime firmware boot. It is
+default-off, depends on device-specific firmware assets, and is not a supported
+CUDA precision mode.
 
-Increase BF16 matrix multiplication performance by enabling the AD102 tensor speed override before macuda starts its normal GPU firmware. Preserve BF16 inputs, FP32 accumulation and existing CUDA/cuBLAS contracts.
+## Objective
 
-The published RTX 4090 experiment reports approximately twice the BF16/FP32 instruction throughput on one card. It explicitly measures instruction issue rather than an application and leaves independent cold-boot reproduction and representative numerical validation pending. This is evidence that the mechanism can work, not a macuda performance guarantee. See [the primary experiment](https://github.com/elias-gaeros/gpu-unlock/blob/rtx4090/rtx4090-register-report.md).
+Enable the AD102 tensor speed override, then verify that macuda's existing BF16
+matrix-multiply path still produces correct results after the normal runtime boot.
 
-Locally, `cuda-shim/libtinycublas/gemm.cu` already has BF16 WMMA tensor kernels with float accumulators. The feature should initially reuse those kernels unchanged. Whether their execution is limited by tensor issue, memory access or occupancy depends on shape and must be measured.
+The feature changes no CUDA API, kernel arithmetic, tolerance, clock, power limit,
+VBIOS, or normal runtime firmware. BF16 input and FP32 accumulation remain the
+primary validation path.
 
-## Scope and exclusions
+## Interface
 
-- Support only the desktop RTX 4090, PCI vendor/device `10de:2684`, with AD102 chip identity independently checked. Reject other devices when the option is requested.
-- Run through macuda's existing TinyGPU hardware interface on this Mac.
-- Optimize BF16 with FP32 accumulation. FP16/FP32 may benefit incidentally but is not the primary acceptance workload.
-- Do not add Ampere, other Ada cards, 4090 D, laptop GPUs or Blackwell support.
-- Do not change clocks, power limits, model precision, VBIOS or normal GEMM arithmetic.
-- Do not promise faster memory-bound decode or integer tensor operations.
-- Initial implementation excludes automatic sleep/resume recovery, concurrent GPU clients and hot-unplug recovery. Reopen and verify after a power transition.
+`TINYNV_TENSOR_UNLOCK` accepts only:
 
-## Proposed interface
-
-`TINYNV_TENSOR_UNLOCK=0|1`, default `0`. Reject other nonempty values. All names in these documents are proposals, not existing options.
-
-With `0`, preserve the current initialization path, without unlock assets, allocations or additional unlock MMIO accesses. Disabling the option does not undo an override already retained by the powered GPU.
-
-With `1`, require the eligible device, validated assets, exclusive access and successful post-boot verification. Fail the open if the requested unlock cannot be established. Do not silently benchmark a stock card as unlocked.
-
-Report stage, device identity, asset revision, raw selector/permission values, elapsed initialization time and final status. Distinguish `verified-existing`, `applied-and-verified`, `unsupported`, `failed-preflight` and `failed-after-start`. A successful function return alone is not proof.
-
-## Functional requirements
-
-1. Validate chip, PCI identity, BAR accessibility, power/link state, reset capability and exclusive ownership before launching firmware.
-2. Load a separately pinned AD102 unlock bundle. Do not substitute macuda's ordinary runtime booter or an Ampere payload. Validate hashes, sizes and every parsed range before device writes.
-3. Inspect the existing override state. A retained override may skip reapplication only after validating effective readout and a usable cold handoff state. An inaccessible register is an error, never evidence of success.
-4. Execute the selected upstream AD102 transaction, verify its completion and required permissions, set selectors, and verify the effective override.
-5. Reset and restore PCI configuration using a verified FLR-equivalent operation; demonstrate that firmware DMA has stopped before releasing its buffers.
-6. Start macuda's existing runtime firmware and verify the override again before creating application work queues or accepting compute launches.
-7. Recheck after any initialization retry/reset; never reuse a stale software success flag.
-8. On failure, preserve the first diagnostic and stop normal initialization. Contain DMA before unmapping host memory. If containment cannot be proven, retain the backing allocations through a transport-owned mechanism or refuse firmware launch until such a mechanism exists.
-
-## Acceptance criteria
-
-| Area | Required evidence |
+| Value | Behavior |
 |---|---|
-| Default path | Existing applicable offline checks pass; disabled-path recorded MMIO behavior remains unchanged |
-| Identification | Wrong device/chip and inaccessible reads are refused without launching unlock firmware |
-| Transaction | Required completion, permission, selector and effective-readout checks pass |
-| Handoff | Override survives transaction reset, runtime boot and an actual BF16 workload |
-| Correctness | Existing GEMM tolerances pass with explicit non-finite rejection; representative application results pass the existing correctness protocol |
-| Lifecycle | At least three independent enclosure power cycles and ten sequential open/workload/close cycles succeed |
-| Performance | Interleaved matched stock/unlocked BF16 GEMMs and prefill show an improvement outside observed run variation; publish all shapes, including neutral/regressing cases |
-| Cleanup | Failure injection demonstrates ordering of DMA containment and release; live runs show no new DART fault, MMU fault or unexplained hang |
+| unset or `0` | Skip all unlock reads, allocations, and device writes |
+| `1` | Require an eligible card and a verified unlock before application work starts |
 
-No fixed application speedup is required to establish a correct unlock. If hardware state is verified but representative BF16 workloads do not improve, report that outcome and keep the feature experimental and off by default.
+Any other non-empty value is rejected. Turning the option off does not restore
+stock hardware state because the powered card may retain the override.
 
-## Sources and provenance
+The observable result is one of:
 
-Research reviewed 2026-11-11. Online `main` and branch links are moving references; implementation must record immutable commit IDs and asset hashes before reuse.
+- `verified-existing`: a retained unlock passed the effective-state gates;
+- `applied-and-verified`: this process applied and verified the transaction;
+- `unsupported`: the device or transport is outside the supported scope;
+- `failed-preflight`: no firmware launch was attempted;
+- `failed-after-start`: firmware may have started and cleanup had to be contained.
 
-- [gpu-unlock overview](https://github.com/Zagitta/gpu-unlock): supported generations and operating model.
-- [AD102 recipes](https://github.com/Zagitta/gpu-unlock/blob/main/kernel/gpu_unlock/recipes.c): chip-specific payload and recipe.
-- [Transaction implementation](https://github.com/Zagitta/gpu-unlock/blob/main/kernel/gpu_unlock/unlock_610.c): lifecycle and hardware operations.
-- Local baseline: `cuda-shim/libtinynv/src/{gpu,dev,flcn,tinynv,pci_tinygpu}.c`, `cuda-shim/libtinycublas/{gemm.cu,cublas.c}`.
+The runtime rechecks the override after any initialization reset and after the
+normal runtime firmware boot, before creating application queues.
 
-The owner explicitly scoped this to personal use and accepted licensing for that scope. Preserve upstream notices and provenance when reusing source. No publication or redistribution work is required by this plan.
+## Safety and lifecycle requirements
+
+- Accept only the desktop RTX 4090 device ID and a matching AD102 chip identity.
+- Require exclusive GPU ownership and a cold, inspectable starting state.
+- Validate every asset by size and SHA-256 before publishing any device address.
+- Check that transaction buffers have aligned, contiguous DART IOVAs below 4 GiB.
+- Verify Falcon completion, privileged-write permissions, selectors, and effective
+  register state. A mailbox marker alone is not success.
+- Treat reset RPC success as insufficient; verify identity, BAR state, firmware
+  state, WPR2 state, and selector retention after every reset.
+- Preserve the first failure and restore the stock signature span on every exit.
+- Release device-visible memory only after firmware DMA is proven stopped.
+- If containment cannot be proven, keep the process, socket, mappings, and GPU lock
+  alive and request physical enclosure power-off before disconnecting.
+
+Catchable termination enters the recovery hold. Signal handlers do not perform
+reentrant socket operations. The hold is best effort: `SIGKILL`, process crash,
+server death, or host failure can still force an unsafe disconnect. Physical power
+cycling is the only verified way to return the card to stock.
+
+## Validation criteria
+
+Offline validation must cover:
+
+- strict option parsing and inert default behavior;
+- wrong-device, wrong-chip, inaccessible-register, and malformed-asset refusal;
+- asset pin drift, transaction stage failures, and reset retention loss;
+- socket timeout and interrupted-transfer behavior;
+- recovery-hold signaling and buffer-retention ordering;
+- BF16 correctness and the normal runtime handoff.
+
+Live validation uses one GPU process at a time and must record:
+
+- the standalone transaction result and all stage gates;
+- override state after the runtime firmware boot and after representative work;
+- BF16 output checks against a CPU reference under unchanged tolerances;
+- a clean cold unload with no new DART or MMU fault; and
+- stock and unlocked timing on the same kernel and input shapes.
+
+The current validation record and remaining gaps are in [validation.md](validation.md).
+
+## Provenance
+
+The asset pipeline pins the independently exercised
+`JustAResearcher/gpu-unlock-ada` revision
+`8855e7bca8ff142204e02301331fd56b26699819`, NVIDIA 610.43.03 inputs, vendored
+license texts, and every generated asset hash. The 610.43.03 unlock bundle is
+separate from macuda's 570.144 runtime bundle. See [assets.md](assets.md) and
+[inputs.md](inputs.md).
+
+The normal runtime is reached through the transport constraints in
+[transport.md](transport.md).
