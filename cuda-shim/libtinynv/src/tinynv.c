@@ -275,7 +275,8 @@ static void catch_the_ways_out(void) {
 }
 
 // The runtime integration gate: the opt-in pre-boot unlock transaction, run BEFORE tinynv_gpu_open so no
-// persistent device/MMU/allocator state exists yet (transport-audit D1). Returns 0 to proceed with the normal boot
+// persistent device/MMU/allocator state exists yet (transport.md's transaction boundary). Returns 0 to proceed
+// with the normal boot
 // (*active=1 only when the option is on AND the override is established), 1 for a contained refusal (the open must
 // fail), 3 after an uncontained failure whose recovery hold the owner confirmed with a physical power-off (the open
 // must also fail; the card is off). Exclusivity: the installed TinyGPU server admits ONE client, and this process

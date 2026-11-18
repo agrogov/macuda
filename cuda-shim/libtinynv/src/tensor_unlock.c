@@ -3,18 +3,21 @@
 //
 // Adapted from JustAResearcher/gpu-unlock-ada @ 8855e7bca8ff142204e02301331fd56b26699819 (GPL-2.0-only),
 // kernel/gpu_unlock/unlock_610.c from the pinned, independently exercised revision. The pure parsers are
-// vendored verbatim in unlock610/. Adaptations, each forced by the transport audit (transport-audit.md):
+// vendored verbatim in unlock610/. Adaptations, each forced by the transport constraints recorded in
+// docs/driver/rtx4090-tensor-unlock/transport.md:
 //   - Linux coherent DMA -> pci->dma_alloc (server shm + DART). Every buffer's IOVAs are checked < 4 GiB,
-//     contiguous and 4 KiB-aligned BEFORE any address is published to firmware (audit §3, inputs F6).
+//     contiguous and 4 KiB-aligned BEFORE any address is published to firmware (transport.md "Buffer
+//     requirements", inputs.md "Transaction invariants").
 //   - One dma mapping per radix page is impossible (server cap: 128 mappings/session); the radix tables and GSP
-//     image pages live in ONE validated-contiguous buffer, sub-allocated at 4 KiB (audit §3 rule 3).
-//   - pcie_flr -> pci->reset, whose RPC status is meaningless (the dext discards Reset's return value, audit §4):
+//     image pages live in ONE validated-contiguous buffer, sub-allocated at 4 KiB (same buffer rules).
+//   - pcie_flr -> pci->reset, whose RPC status is meaningless (the dext discards Reset's return value,
+//     transport.md "Reset semantics"):
 //     only verified effects count. Apple's FunctionReset saves/restores config itself; BARs/COMMAND are still
 //     verified and repaired from the claim-time snapshot (dev.c pattern).
 //   - dma_wmb -> atomic_thread_fence(memory_order_release); ktime -> tinynv_now_s; bounded polls everywhere.
 //   - Module-reference retention is impossible in userspace. firmware_started && !quiesced => recovery_required:
-//     the caller keeps process/socket/mappings alive until an enclosure power-off (O14
-//     crash retention is a known limitation, not a guarantee claimed here).
+//     the caller keeps process/socket/mappings alive until an enclosure power-off (crash retention is a
+//     known limitation, not a guarantee claimed here).
 //   - GA102 paths and the AD103 canary are dropped: this file admits 10de:2684 / AD102 only, per spec.
 //   - gpu_unlock_remove_apertures (Linux framebuffer handoff) has no macOS counterpart and is not ported.
 #include "tensor_unlock.h"
@@ -53,7 +56,7 @@ _Static_assert(GU_SS0_UNLOCK == TU_UNLOCK_SS0 && GU_SS1_UNLOCK == TU_UNLOCK_SS1,
 _Static_assert(GU_SPEED_READOUT_MASK == TU_UNLOCK_READOUT_MASK, "public readout mask drifted");
 #define BOOTER_MAGIC 0x314c5442u
 #define TU_BOOT_IMAGE_SIZE 36864u
-#define TU_DMA_LIMIT (1ull << 32) // the recipe's descriptor fields are 32-bit (inputs F6)
+#define TU_DMA_LIMIT (1ull << 32) // the recipe's descriptor fields are 32-bit (inputs.md: the sub-4-GiB rule)
 
 #define PCI_COMMAND 0x04
 #define PCI_COMMAND_MEMORY 0x2
@@ -331,7 +334,7 @@ static uint32_t tu_find_cap(tu_work_t *w, uint32_t id) {
   return 0;
 }
 
-// ---- transaction memory (audit §3: validate before publication, fail closed) -----------------------------------------
+// ---- transaction memory (transport.md "Buffer requirements": validate before publication, fail closed) ------
 
 static int tu_dma_alloc(tu_work_t *w, const char *name, size_t size, uint64_t *iova, tinynv_dma_t **out) {
   if (w->nbuf >= TU_MAX_BUFFERS) return TU_FAIL(w, ENOMEM, "too many transaction buffers");
@@ -719,7 +722,7 @@ static int tu_dma(tu_work_t *w) {
   if (ret) return ret;
 
   // Radix tables + GSP image pages in ONE contiguous validated mapping (the server allows 128 mappings/session;
-  // one mapping per 4 KiB page would need ~20600). Sub-allocations stay 4 KiB-aligned (audit §3 rule 3).
+  // one mapping per 4 KiB page would need ~20600). Sub-allocations stay 4 KiB-aligned (the same contiguity rule).
   const struct gpu_unlock_radix_plan *r = &w->assets->radix;
   uint64_t page_count = r->table_pages + r->pages[3];
   if (tu_dma_alloc(w, "radix+image", (size_t)(page_count * GU_RADIX_PAGE), &iova, &radix)) return w->error;
@@ -769,8 +772,8 @@ static int tu_gfw(tu_work_t *w) {
   w->r->ss1_entry = ss1;
   fprintf(stderr, "tensor-unlock: entry: plm=%#x ss0=%#x ss1=%#x wpr2_hi=%#x\n", w->plm_entry, ss0, ss1, wpr_hi);
   if (w->plm_entry == ~0u) {
-    // Retained override. Spec req 3: skipping reapplication requires effective readout AND a usable cold handoff
-    // state, not just an open PLM (upstream returns -EALREADY here without those checks; inputs F2/F4).
+    // Retained override. Spec: skipping reapplication requires effective readout AND a usable cold handoff state,
+    // not just an open PLM (upstream returns -EALREADY here without those checks; inputs.md's invariants).
     if (wpr_hi >> 4) return TU_FAIL(w, EBUSY, "override retained but WPR2 is up: not a cold handoff; power off first");
     if (ss0 != GU_SS0_UNLOCK || ss1 != GU_SS1_UNLOCK)
       return TU_FAIL(w, EALREADY, "FEAT open but selectors are %#x/%#x: ambiguous retained state", ss0, ss1);
@@ -1061,7 +1064,8 @@ static int tu_reset(tu_work_t *w) {
   if (command == 0xffff || (command & PCI_COMMAND_MASTER)) return TU_FAIL(w, EIO, "bus master still set after quiesce");
   if (tu_rd(w, 0, &chip) || !chip || tu_inaccessible(chip)) return TU_FAIL(w, ENODEV, "chip id inaccessible before FLR");
   fprintf(stderr, "tensor-unlock: FLR begin: BME=0, DMA retained, chip=%#x\n", chip);
-  // The RPC status is meaningless (the dext discards Reset's return value, audit §4): only verified effects count.
+  // The RPC status is meaningless (the dext discards Reset's return value, per transport.md "Reset semantics"):
+  // only verified effects count.
   // Apple's FunctionReset saves/restores config space itself and blocks until the link is up.
   w->pci->reset(w->pci);
   uint32_t identity = tu_cfg(w, 0, 4);

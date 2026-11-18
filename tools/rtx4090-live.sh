@@ -16,7 +16,7 @@
 # NO KILLING TIMEOUT: the probe is NEVER wrapped in timeout(1) or a harness kill. If firmware may still DMA, the
 # probe keeps the process/socket/mappings alive until the operator powers the enclosure off and confirms
 # ('off' + Enter, or SIGUSR1 to the pid it prints). Killing it force-unmaps under a possibly-live firmware
-# (transport-audit O14 — the documented crash limitation). Run `unlock` from an interactive terminal.
+# (the documented crash limitation in transport.md "Containment"). Run `unlock` from an interactive terminal.
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 cd "$R" || exit 2
 MODE=${1:-}

@@ -101,9 +101,10 @@ static void lock_release(void) {
 
 // ---- recovery hold -----------------------------------------------------------------------------------------------------
 
-// The containment cannot be proven: firmware may still DMA into the transaction buffers. The installed transport
-// force-unmaps everything on disconnect (transport-audit O14), so this process keeps the socket, the mappings and
-// the lock alive, issues no further GPU work, and waits for the owner to power the enclosure off. SIGKILL/crash/
+// The containment cannot be proven: firmware may still DMA into the transaction buffers, and the installed
+// transport force-unmaps everything on disconnect (transport.md "Containment"), so this process keeps the
+// socket, the mappings and the lock alive, issues no further GPU work, and waits for the owner to power the
+// enclosure off. SIGKILL/crash/
 // server death defeat this — that is the documented crash limitation, not a guarantee this program can make.
 // The hold itself is tensor_unlock_recovery_hold (shared with the runtime integration; tested end-to-end by
 // test_probe_recovery.py through this binary).

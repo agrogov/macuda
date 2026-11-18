@@ -276,7 +276,8 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
   int buf = 64 << 20;
   setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
   setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
-  // A wedged server must not block recv forever (transport-audit O9/D6): every read is a round trip the server
+  // A wedged server must not block recv forever (transport.md "Waiting and errors"): every read is a round trip
+  // the server
   // answers immediately, so a generous ceiling costs nothing on the normal path. A timeout poisons the connection
   // (xfer_all); it is a failure with containment, never a success and never a silent retry. 0 disables the ceiling.
   long timeout_s = 30;

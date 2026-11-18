@@ -11,7 +11,8 @@ this driver provides a pty and NOTHING ELSE:
     the control file (default /tmp/macuda-tensor-unlock-confirm-off) after physically powering the enclosure off — or the
     operator sends SIGUSR1 to the probe pid directly (the probe's own documented path);
   * it has NO timeout and never kills the runner or the probe. If the probe holds ownership under uncertain
-    containment, this driver stays alive with it (transport-audit O14: killing force-unmaps under live firmware).
+    containment, this driver stays alive with it (transport.md "Containment": killing force-unmaps under live
+    firmware).
 
 Usage:  python3 tools/rtx4090-live-drive.py [transcript-log] [command...]
 Default command: sh tools/rtx4090-live.sh unlock. Exit code = the runner's exit code.

@@ -5,7 +5,8 @@
 // (JustAResearcher/gpu-unlock-ada @ 8855e7bca8ff142204e02301331fd56b26699819, GPL-2.0-only,
 // kernel/gpu_unlock/unlock_610.c) to tinynv_pci_t. The pure parsers are vendored verbatim in unlock610/.
 //
-// It runs BEFORE any normal macuda device/MMU/allocator state exists (transport-audit.md D1): raw pci ops plus a
+// It runs BEFORE any normal macuda device/MMU/allocator state exists (the transaction-boundary finding in
+// docs/driver/rtx4090-tensor-unlock/transport.md): raw pci ops plus a
 // temporary BAR0 window only. Callers: the standalone probe (tools/rtx4090-probe) and the optional
 // default-off runtime gate (tinynv_tensor_unlock_gate in tinynv.c, TINYNV_TENSOR_UNLOCK=1). Off by default.
 //
@@ -13,7 +14,8 @@
 // If firmware may still access host buffers and containment cannot be proven, the result says recovery_required:
 // the caller MUST keep this process, its socket and its mappings alive, stop issuing GPU work, and request an
 // enclosure power-off before disconnecting. That is best-effort recovery, NOT crash-proof retention: SIGKILL, a
-// client crash, server death or host failure still force-unmap (transport-audit O14, a known limitation).
+// client crash, server death or host failure still force-unmap (the transport document's containment limit,
+// a known limitation).
 #ifndef TINYNV_TENSOR_UNLOCK_H
 #define TINYNV_TENSOR_UNLOCK_H
 #include "tinynv_pci.h"
@@ -153,7 +155,7 @@ typedef struct {
 // Read-only post-boot snapshot through the NORMAL device path (tinynv_rd32 on the booted device's BAR0 window).
 // Requires an already-booted, non-failed runtime device: it never boots implicitly and issues no writes, no reset,
 // no DMA. Returns 0 and fills *out (check valid/unlocked), or -1 when there is no live booted device to read.
-// An inaccessible register is reported as valid=0, never as evidence of success (spec requirement 3).
+// An inaccessible register is reported as valid=0, never as evidence of success (spec.md's register gates).
 struct tinynv_device;
 int tensor_unlock_postboot(struct tinynv_device *d, tensor_unlock_state_t *out);
 
