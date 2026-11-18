@@ -80,8 +80,8 @@ make -C cuda-shim/libtinynv BUILD=build-gsp610 \
 git diff --check upstream/main...HEAD
 ```
 
-must pass with no private worktree paths or machine-specific state.
-on another feature branch.
+must pass with no private worktree paths or machine-specific state. The
+`git diff --check` range is the feature branch's own diff against `upstream/main`.
 
 ## Deliberate exclusions
 
